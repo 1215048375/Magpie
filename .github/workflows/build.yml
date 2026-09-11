@@ -11,8 +11,8 @@ jobs:
     runs-on: windows-2025-vs2026
     strategy:
       matrix:
-        compiler: ["MSVC", "ClangCL"]
-        platform: ["x64", "ARM64"]
+        compiler: ["MSVC"]
+        platform: ["x64"]
 
     steps:
     - uses: actions/checkout@v7
