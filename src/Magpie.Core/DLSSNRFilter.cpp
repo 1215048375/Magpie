@@ -58,10 +58,221 @@ DLSSNRSettings ParseDLSSNRSettings(const EffectOption& option, bool hdrEnabled) 
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
 #include <atomic>
+#include <array>
+#include <cstring>
+#include <mutex>
 
 namespace Magpie {
 
 namespace {
+
+
+#if defined(_M_X64)
+
+constexpr uint32_t NVAPI_ID_GPU_GET_ARCH_INFO = 0xD8265D24u;
+constexpr uint32_t NVAPI_ARCH_AMPERE = 0x0170u;
+constexpr uint32_t NVAPI_ARCH_BLACKWELL2 = 0x01B0u;
+constexpr size_t NVAPI_ARCH_HOOK_SIZE = 12;
+
+struct NvGpuArchInfoCompat {
+	uint32_t version;
+	uint32_t architecture;
+	uint32_t implementation;
+	uint32_t revision;
+};
+
+using NvApiQueryInterfaceFn = void* (__cdecl*)(uint32_t);
+using NvApiGpuGetArchInfoFn = int(__cdecl*)(
+	void* physicalGpu,
+	NvGpuArchInfoCompat* archInfo);
+
+std::mutex g_nvapiArchHookMutex;
+NvApiGpuGetArchInfoFn g_nvapiGpuGetArchInfo = nullptr;
+std::array<uint8_t, NVAPI_ARCH_HOOK_SIZE> g_nvapiArchOriginalBytes{};
+bool g_nvapiArchHookPatched = false;
+std::atomic<bool> g_nvapiArchSpoofLogged = false;
+
+int __cdecl NvApiGpuGetArchInfoHook(
+	void* physicalGpu,
+	NvGpuArchInfoCompat* archInfo) noexcept;
+
+bool SetNvApiArchHookPatched(bool patched) noexcept {
+	if (!g_nvapiGpuGetArchInfo) return false;
+	void* const target = reinterpret_cast<void*>(g_nvapiGpuGetArchInfo);
+
+	DWORD oldProtection = 0;
+	if (!VirtualProtect(
+		target, NVAPI_ARCH_HOOK_SIZE, PAGE_EXECUTE_READWRITE, &oldProtection)) {
+		return false;
+	}
+
+	if (patched) {
+		std::array<uint8_t, NVAPI_ARCH_HOOK_SIZE> jump{
+			0x48, 0xB8, // mov rax, imm64
+			0, 0, 0, 0, 0, 0, 0, 0,
+			0xFF, 0xE0 // jmp rax
+		};
+		const uintptr_t handler =
+			reinterpret_cast<uintptr_t>(&NvApiGpuGetArchInfoHook);
+		std::memcpy(jump.data() + 2, &handler, sizeof(handler));
+		std::memcpy(target, jump.data(), jump.size());
+	} else {
+		std::memcpy(
+			target, g_nvapiArchOriginalBytes.data(),
+			g_nvapiArchOriginalBytes.size());
+	}
+
+	FlushInstructionCache(
+		GetCurrentProcess(), target, NVAPI_ARCH_HOOK_SIZE);
+
+	g_nvapiArchHookPatched = patched;
+
+	DWORD ignoredProtection = 0;
+	(void)VirtualProtect(
+		target, NVAPI_ARCH_HOOK_SIZE, oldProtection, &ignoredProtection);
+	return true;
+}
+
+int __cdecl NvApiGpuGetArchInfoHook(
+	void* physicalGpu,
+	NvGpuArchInfoCompat* archInfo) noexcept {
+	std::scoped_lock lock(g_nvapiArchHookMutex);
+
+	if (!g_nvapiGpuGetArchInfo) return -1;
+
+	// Match NeuralScreen's strategy: briefly restore NVIDIA's original
+	// prologue, call the real function, then reinstall the hook. This avoids
+	// a hand-written trampoline and preserves all GPU-handle semantics.
+	if (!SetNvApiArchHookPatched(false)) return -1;
+	const int status = g_nvapiGpuGetArchInfo(physicalGpu, archInfo);
+	const bool hookRestored = SetNvApiArchHookPatched(true);
+
+	if (!hookRestored) {
+		Logger::Get().Warn(
+			"DLSSNR NVAPI arch spoof: failed to reinstall hook after real call");
+	}
+
+	// Keep the first experiment deliberately narrow: only Ampere is rewritten.
+	// RTX 3080 reports 0x170; the DLSSNR gate expects Blackwell2 (0x1B0).
+	if (status == 0 && archInfo &&
+		archInfo->architecture == NVAPI_ARCH_AMPERE) {
+		const uint32_t realArchitecture = archInfo->architecture;
+		archInfo->architecture = NVAPI_ARCH_BLACKWELL2;
+		if (!g_nvapiArchSpoofLogged.exchange(true, std::memory_order_relaxed)) {
+			Logger::Get().Info(fmt::format(
+				"DLSSNR NVAPI arch spoof: real={:#x} spoofed={:#x}",
+				realArchitecture, archInfo->architecture));
+		}
+	}
+
+	return status;
+}
+
+class ScopedNvApiArchSpoof {
+public:
+	ScopedNvApiArchSpoof() = default;
+	ScopedNvApiArchSpoof(const ScopedNvApiArchSpoof&) = delete;
+	ScopedNvApiArchSpoof& operator=(const ScopedNvApiArchSpoof&) = delete;
+
+	~ScopedNvApiArchSpoof() {
+		Remove();
+	}
+
+	bool Install() noexcept {
+		std::scoped_lock lock(g_nvapiArchHookMutex);
+		if (_installed) return true;
+		if (g_nvapiArchHookPatched || g_nvapiGpuGetArchInfo) {
+			Logger::Get().Warn(
+				"DLSSNR NVAPI arch spoof: another hook instance is already active");
+			return false;
+		}
+
+		_nvapiModule = LoadLibraryW(L"nvapi64.dll");
+		if (!_nvapiModule) {
+			Logger::Get().Win32Error(
+				"DLSSNR NVAPI arch spoof: LoadLibrary(nvapi64.dll) failed");
+			return false;
+		}
+
+		const auto queryInterface = reinterpret_cast<NvApiQueryInterfaceFn>(
+			GetProcAddress(_nvapiModule, "nvapi_QueryInterface"));
+		if (!queryInterface) {
+			Logger::Get().Win32Error(
+				"DLSSNR NVAPI arch spoof: nvapi_QueryInterface not found");
+			FreeLibrary(_nvapiModule);
+			_nvapiModule = nullptr;
+			return false;
+		}
+
+		g_nvapiGpuGetArchInfo = reinterpret_cast<NvApiGpuGetArchInfoFn>(
+			queryInterface(NVAPI_ID_GPU_GET_ARCH_INFO));
+		if (!g_nvapiGpuGetArchInfo) {
+			Logger::Get().Error(
+				"DLSSNR NVAPI arch spoof: NvAPI_GPU_GetArchInfo lookup failed");
+			FreeLibrary(_nvapiModule);
+			_nvapiModule = nullptr;
+			return false;
+		}
+
+		std::memcpy(
+			g_nvapiArchOriginalBytes.data(),
+			reinterpret_cast<const void*>(g_nvapiGpuGetArchInfo),
+			g_nvapiArchOriginalBytes.size());
+
+		if (!SetNvApiArchHookPatched(true)) {
+			Logger::Get().Win32Error(
+				"DLSSNR NVAPI arch spoof: failed to patch NvAPI_GPU_GetArchInfo");
+			g_nvapiGpuGetArchInfo = nullptr;
+			FreeLibrary(_nvapiModule);
+			_nvapiModule = nullptr;
+			return false;
+		}
+
+		_installed = true;
+		g_nvapiArchSpoofLogged.store(false, std::memory_order_relaxed);
+		Logger::Get().Info(
+			"DLSSNR NVAPI arch spoof: hook installed for initialization");
+		return true;
+	}
+
+private:
+	void Remove() noexcept {
+		std::scoped_lock lock(g_nvapiArchHookMutex);
+		if (!_installed) return;
+
+		if (g_nvapiArchHookPatched && !SetNvApiArchHookPatched(false)) {
+			Logger::Get().Warn(
+				"DLSSNR NVAPI arch spoof: failed to restore original prologue");
+			// Do not unload nvapi64.dll while a jump into Magpie may remain.
+			_nvapiModule = nullptr;
+		} else if (_nvapiModule) {
+			FreeLibrary(_nvapiModule);
+			_nvapiModule = nullptr;
+		}
+
+		g_nvapiGpuGetArchInfo = nullptr;
+		g_nvapiArchHookPatched = false;
+		_installed = false;
+		Logger::Get().Info(
+			"DLSSNR NVAPI arch spoof: hook removed after initialization");
+	}
+
+	HMODULE _nvapiModule = nullptr;
+	bool _installed = false;
+};
+
+#else
+
+class ScopedNvApiArchSpoof {
+public:
+	bool Install() noexcept {
+		Logger::Get().Warn(
+			"DLSSNR NVAPI arch spoof is only implemented for Windows x64");
+		return false;
+	}
+};
+
+#endif
 
 void LogDlssnrStatus(std::string message, bool error = false) noexcept {
 	if (error) {
@@ -1889,6 +2100,7 @@ bool DLSSNRFilter::Initialize(
 	_ngxCore = &ngxCore;
 	_impl.reset();
 	FrameGuidancePerformance::ResetDlssnrGpuTiming();
+	ScopedNvApiArchSpoof archSpoof;
 	auto impl = std::make_unique<Impl>();
 	impl->device11 = resources.GetD3DDevice();
 	impl->context11 = resources.GetD3DDC();
@@ -1936,6 +2148,10 @@ bool DLSSNRFilter::Initialize(
 		inputDesc.Height;
 	impl->convertInputToRgba = inputDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
 
+	if (!archSpoof.Install()) {
+		Logger::Get().Warn(
+			"DLSSNR NVAPI arch spoof unavailable; continuing without spoof");
+	}
 	if (!ngxCore.Acquire(resources, "DLSSNR")) {
 		return false;
 	}
