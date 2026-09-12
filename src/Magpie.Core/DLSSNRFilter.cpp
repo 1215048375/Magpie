@@ -293,6 +293,165 @@ void DownsampleGuidance(uint3 tid : SV_DispatchThreadID) {
 }
 )";
 
+
+constexpr uint32_t INTERNAL_MOTION_MAX_WIDTH = 320;
+constexpr uint32_t INTERNAL_MOTION_MAX_HEIGHT = 180;
+constexpr uint32_t INTERNAL_MOTION_SEARCH_RADIUS = 4;
+
+constexpr char INTERNAL_MOTION_HLSL[] = R"(
+Texture2D<float4> MotionInputColor : register(t0);
+Texture2D<float> MotionCurrentGray : register(t1);
+Texture2D<float> MotionPreviousGray : register(t2);
+Texture2D<float2> MotionCoarseFlow : register(t3);
+RWTexture2D<float> MotionGrayOutput : register(u0);
+RWTexture2D<float2> MotionFlowOutput : register(u1);
+RWTexture2D<float2> MotionUpscaledOutput : register(u2);
+
+cbuffer InternalMotionParams : register(b0) {
+    uint2 MotionInputExtent;
+    uint2 MotionGuideExtent;
+    float2 MotionGuideToInput;
+    uint MotionHasHistory;
+    uint MotionPadding0;
+};
+
+float Luma(float3 rgb) {
+    return dot(rgb, float3(0.2126, 0.7152, 0.0722));
+}
+
+[numthreads(8, 8, 1)]
+void BuildMotionGray(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= MotionGuideExtent)) return;
+    float2 sourceStart = float2(tid.xy) * float2(MotionInputExtent) /
+        float2(MotionGuideExtent);
+    float2 sourceEnd = float2(tid.xy + 1) * float2(MotionInputExtent) /
+        float2(MotionGuideExtent);
+    int2 first = int2(floor(sourceStart));
+    int2 last = int2(ceil(sourceEnd));
+    float total = 0.0;
+    float totalWeight = 0.0;
+    [loop]
+    for (int y = first.y; y < last.y; ++y) {
+        float wy = max(0.0, min(sourceEnd.y, float(y + 1)) -
+            max(sourceStart.y, float(y)));
+        [loop]
+        for (int x = first.x; x < last.x; ++x) {
+            float wx = max(0.0, min(sourceEnd.x, float(x + 1)) -
+                max(sourceStart.x, float(x)));
+            float w = wx * wy;
+            int2 p = clamp(int2(x, y), int2(0, 0), int2(MotionInputExtent) - 1);
+            total += Luma(MotionInputColor.Load(int3(p, 0)).rgb) * w;
+            totalWeight += w;
+        }
+    }
+    MotionGrayOutput[tid.xy] = total / max(totalWeight, 1e-6);
+}
+
+float MotionPatchCost(int2 center, int2 offset) {
+    float cost = 0.0;
+    [unroll]
+    for (int py = -1; py <= 1; ++py) {
+        [unroll]
+        for (int px = -1; px <= 1; ++px) {
+            int2 currentP = clamp(center + int2(px, py), int2(0, 0),
+                int2(MotionGuideExtent) - 1);
+            int2 previousP = clamp(center + offset + int2(px, py), int2(0, 0),
+                int2(MotionGuideExtent) - 1);
+            float a = MotionCurrentGray.Load(int3(currentP, 0));
+            float b = MotionPreviousGray.Load(int3(previousP, 0));
+            cost += abs(a - b);
+        }
+    }
+    return cost;
+}
+
+float MotionLocalVariance(int2 center) {
+    float total = 0.0;
+    float totalSq = 0.0;
+    [unroll]
+    for (int py = -1; py <= 1; ++py) {
+        [unroll]
+        for (int px = -1; px <= 1; ++px) {
+            int2 p = clamp(center + int2(px, py), int2(0, 0),
+                int2(MotionGuideExtent) - 1);
+            float v = MotionCurrentGray.Load(int3(p, 0));
+            total += v;
+            totalSq += v * v;
+        }
+    }
+    float mean = total / 9.0;
+    return max(0.0, totalSq / 9.0 - mean * mean);
+}
+
+[numthreads(8, 8, 1)]
+void EstimateMotion(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= MotionGuideExtent)) return;
+    if (MotionHasHistory == 0) {
+        MotionFlowOutput[tid.xy] = 0.0;
+        return;
+    }
+    int2 center = int2(tid.xy);
+    // Flat regions do not contain enough information for stable block matching.
+    if (MotionLocalVariance(center) < 2.5e-5) {
+        MotionFlowOutput[tid.xy] = 0.0;
+        return;
+    }
+
+    float bestCost = 1e20;
+    int2 bestOffset = 0;
+    [loop]
+    for (int y = -4; y <= 4; ++y) {
+        [loop]
+        for (int x = -4; x <= 4; ++x) {
+            int2 candidate = int2(x, y);
+            float cost = MotionPatchCost(center, candidate);
+            if (cost < bestCost) {
+                bestCost = cost;
+                bestOffset = candidate;
+            }
+        }
+    }
+
+    float2 refined = float2(bestOffset);
+    if (bestOffset.x > -4 && bestOffset.x < 4) {
+        float l = MotionPatchCost(center, bestOffset + int2(-1, 0));
+        float c = bestCost;
+        float r = MotionPatchCost(center, bestOffset + int2(1, 0));
+        float d = l - 2.0 * c + r;
+        if (abs(d) > 1e-5) refined.x += clamp(0.5 * (l - r) / d, -0.5, 0.5);
+    }
+    if (bestOffset.y > -4 && bestOffset.y < 4) {
+        float u = MotionPatchCost(center, bestOffset + int2(0, -1));
+        float c = bestCost;
+        float dwn = MotionPatchCost(center, bestOffset + int2(0, 1));
+        float d = u - 2.0 * c + dwn;
+        if (abs(d) > 1e-5) refined.y += clamp(0.5 * (u - dwn) / d, -0.5, 0.5);
+    }
+    // Search is performed in the previous frame around the current pixel, so
+    // the vector is current -> previous, matching the DLSSNR motion contract.
+    MotionFlowOutput[tid.xy] = refined;
+}
+
+float2 LoadCoarseClamped(int2 p) {
+    p = clamp(p, int2(0, 0), int2(MotionGuideExtent) - 1);
+    return MotionCoarseFlow.Load(int3(p, 0));
+}
+
+[numthreads(8, 8, 1)]
+void UpscaleMotion(uint3 tid : SV_DispatchThreadID) {
+    if (any(tid.xy >= MotionInputExtent)) return;
+    float2 guidePos = (float2(tid.xy) + 0.5) * float2(MotionGuideExtent) /
+        float2(MotionInputExtent) - 0.5;
+    int2 base = int2(floor(guidePos));
+    float2 f = frac(guidePos);
+    float2 a = lerp(LoadCoarseClamped(base),
+        LoadCoarseClamped(base + int2(1, 0)), f.x);
+    float2 b = lerp(LoadCoarseClamped(base + int2(0, 1)),
+        LoadCoarseClamped(base + int2(1, 1)), f.x);
+    MotionUpscaledOutput[tid.xy] = lerp(a, b, f.y) * MotionGuideToInput;
+}
+)";
+
 constexpr char RESIDUAL_PREPARE_HLSL[] = R"(
 Texture2D<float4> ReducedColor : register(t0);
 Texture2D<float4> ReducedDenoised : register(t1);
@@ -527,6 +686,18 @@ struct ResampleConstants {
 };
 static_assert(sizeof(ResampleConstants) == 48);
 
+struct InternalMotionConstants {
+	uint32_t inputWidth = 0;
+	uint32_t inputHeight = 0;
+	uint32_t guideWidth = 0;
+	uint32_t guideHeight = 0;
+	float guideToInputX = 1.0f;
+	float guideToInputY = 1.0f;
+	uint32_t hasHistory = 0;
+	uint32_t padding0 = 0;
+};
+static_assert(sizeof(InternalMotionConstants) == 32);
+
 bool NGXSucceeded(NVSDK_NGX_Result result) noexcept {
 	return NVSDK_NGX_SUCCEED(result);
 }
@@ -629,6 +800,21 @@ struct DLSSNRFilter::Impl {
 	winrt::com_ptr<ID3D11Texture2D> sharedInput11;
 	winrt::com_ptr<ID3D11Texture2D> sharedOutput11;
 	winrt::com_ptr<ID3D11Texture2D> workerMotion11;
+	winrt::com_ptr<ID3D11ShaderResourceView> internalMotionColorSrv11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> workerMotionUav11;
+	winrt::com_ptr<ID3D11Texture2D> internalMotionCurrentGray11;
+	winrt::com_ptr<ID3D11Texture2D> internalMotionPreviousGray11;
+	winrt::com_ptr<ID3D11Texture2D> internalMotionCoarseFlow11;
+	winrt::com_ptr<ID3D11ShaderResourceView> internalMotionCurrentGraySrv11;
+	winrt::com_ptr<ID3D11ShaderResourceView> internalMotionPreviousGraySrv11;
+	winrt::com_ptr<ID3D11ShaderResourceView> internalMotionCoarseFlowSrv11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> internalMotionCurrentGrayUav11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> internalMotionPreviousGrayUav11;
+	winrt::com_ptr<ID3D11UnorderedAccessView> internalMotionCoarseFlowUav11;
+	winrt::com_ptr<ID3D11ComputeShader> internalMotionGrayShader11;
+	winrt::com_ptr<ID3D11ComputeShader> internalMotionEstimateShader11;
+	winrt::com_ptr<ID3D11ComputeShader> internalMotionUpscaleShader11;
+	winrt::com_ptr<ID3D11Buffer> internalMotionConstants11;
 	winrt::com_ptr<ID3D11ShaderResourceView> inputSrv11;
 	winrt::com_ptr<ID3D11ShaderResourceView> sharedInputSrv11;
 	winrt::com_ptr<ID3D11ShaderResourceView> sharedOutputSrv11;
@@ -699,6 +885,10 @@ struct DLSSNRFilter::Impl {
 	uint64_t duplicateFrameReuseCount = 0;
 	uint32_t sourceWidth = 0;
 	uint32_t sourceHeight = 0;
+	uint32_t internalMotionGuideWidth = 0;
+	uint32_t internalMotionGuideHeight = 0;
+	bool internalMotionHistoryValid = false;
+	uint64_t internalMotionFramesWithHistory = 0;
 	uint32_t width = 0;
 	uint32_t height = 0;
 	bool convertInputToRgba = false;
@@ -1175,7 +1365,7 @@ static bool StartExternalWorker(
 	D3D11_TEXTURE2D_DESC motionDesc = sharedDesc;
 	motionDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
 	if (!CreateWorkerSharedTexture(
-		impl, motionDesc, false,
+		impl, motionDesc, true,
 		MotionName(impl.workerSession),
 		impl.workerMotion11,
 		impl.workerMotionSharedHandle)) {
@@ -1523,6 +1713,220 @@ static bool CreateComputeShader(
 		return false;
 	}
 	return true;
+}
+
+
+static bool CreateInternalMotionResources(
+    DLSSNRFilter::Impl& impl
+) noexcept {
+    const double scale = std::min({
+        1.0,
+        double(INTERNAL_MOTION_MAX_WIDTH) / double(std::max(1u, impl.width)),
+        double(INTERNAL_MOTION_MAX_HEIGHT) / double(std::max(1u, impl.height))
+    });
+    impl.internalMotionGuideWidth = std::max(
+        1u, static_cast<uint32_t>(std::lround(double(impl.width) * scale)));
+    impl.internalMotionGuideHeight = std::max(
+        1u, static_cast<uint32_t>(std::lround(double(impl.height) * scale)));
+
+    HRESULT hr = impl.device11->CreateShaderResourceView(
+        impl.sharedInput11.get(), nullptr, impl.internalMotionColorSrv11.put());
+    if (SUCCEEDED(hr)) {
+        hr = impl.device11->CreateUnorderedAccessView(
+            impl.workerMotion11.get(), nullptr, impl.workerMotionUav11.put());
+    }
+    if (FAILED(hr)) {
+        Logger::Get().ComError(
+            "Create DLSSNR internal motion shared views failed", hr);
+        return false;
+    }
+
+    constexpr UINT MOTION_BIND =
+        D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    impl.internalMotionCurrentGray11 = DirectXHelper::CreateTexture2D(
+        impl.device11, DXGI_FORMAT_R32_FLOAT,
+        impl.internalMotionGuideWidth, impl.internalMotionGuideHeight,
+        MOTION_BIND);
+    impl.internalMotionPreviousGray11 = DirectXHelper::CreateTexture2D(
+        impl.device11, DXGI_FORMAT_R32_FLOAT,
+        impl.internalMotionGuideWidth, impl.internalMotionGuideHeight,
+        MOTION_BIND);
+    impl.internalMotionCoarseFlow11 = DirectXHelper::CreateTexture2D(
+        impl.device11, DXGI_FORMAT_R16G16_FLOAT,
+        impl.internalMotionGuideWidth, impl.internalMotionGuideHeight,
+        MOTION_BIND);
+    if (!impl.internalMotionCurrentGray11 || !impl.internalMotionPreviousGray11 ||
+        !impl.internalMotionCoarseFlow11) {
+        Logger::Get().Error("Create DLSSNR internal motion textures failed");
+        return false;
+    }
+
+    auto createViews = [&](ID3D11Texture2D* texture,
+        winrt::com_ptr<ID3D11ShaderResourceView>& srv,
+        winrt::com_ptr<ID3D11UnorderedAccessView>& uav) noexcept {
+        HRESULT localHr = impl.device11->CreateShaderResourceView(
+            texture, nullptr, srv.put());
+        if (SUCCEEDED(localHr)) {
+            localHr = impl.device11->CreateUnorderedAccessView(
+                texture, nullptr, uav.put());
+        }
+        return localHr;
+    };
+    hr = createViews(
+        impl.internalMotionCurrentGray11.get(),
+        impl.internalMotionCurrentGraySrv11,
+        impl.internalMotionCurrentGrayUav11);
+    if (SUCCEEDED(hr)) {
+        hr = createViews(
+            impl.internalMotionPreviousGray11.get(),
+            impl.internalMotionPreviousGraySrv11,
+            impl.internalMotionPreviousGrayUav11);
+    }
+    if (SUCCEEDED(hr)) {
+        hr = createViews(
+            impl.internalMotionCoarseFlow11.get(),
+            impl.internalMotionCoarseFlowSrv11,
+            impl.internalMotionCoarseFlowUav11);
+    }
+    if (FAILED(hr)) {
+        Logger::Get().ComError(
+            "Create DLSSNR internal motion texture views failed", hr);
+        return false;
+    }
+
+    D3D11_BUFFER_DESC constantsDesc{};
+    constantsDesc.ByteWidth = sizeof(InternalMotionConstants);
+    constantsDesc.Usage = D3D11_USAGE_DEFAULT;
+    constantsDesc.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    hr = impl.device11->CreateBuffer(
+        &constantsDesc, nullptr, impl.internalMotionConstants11.put());
+    if (FAILED(hr)) {
+        Logger::Get().ComError(
+            "Create DLSSNR internal motion constants failed", hr);
+        return false;
+    }
+
+    if (!CreateComputeShader(
+            impl, INTERNAL_MOTION_HLSL, "BuildMotionGray",
+            "DLSSNRInternalMotionGray", impl.internalMotionGrayShader11) ||
+        !CreateComputeShader(
+            impl, INTERNAL_MOTION_HLSL, "EstimateMotion",
+            "DLSSNRInternalMotionEstimate", impl.internalMotionEstimateShader11) ||
+        !CreateComputeShader(
+            impl, INTERNAL_MOTION_HLSL, "UpscaleMotion",
+            "DLSSNRInternalMotionUpscale", impl.internalMotionUpscaleShader11)) {
+        return false;
+    }
+
+    const float zero[4]{};
+    impl.context11->ClearUnorderedAccessViewFloat(
+        impl.workerMotionUav11.get(), zero);
+    impl.context11->ClearUnorderedAccessViewFloat(
+        impl.internalMotionCurrentGrayUav11.get(), zero);
+    impl.context11->ClearUnorderedAccessViewFloat(
+        impl.internalMotionPreviousGrayUav11.get(), zero);
+    impl.context11->ClearUnorderedAccessViewFloat(
+        impl.internalMotionCoarseFlowUav11.get(), zero);
+    impl.internalMotionHistoryValid = false;
+    impl.internalMotionFramesWithHistory = 0;
+
+    Logger::Get().Info(fmt::format(
+        "DLSSNR internal motion ready: input={}x{} guide={}x{} searchRadius={}",
+        impl.width, impl.height,
+        impl.internalMotionGuideWidth, impl.internalMotionGuideHeight,
+        INTERNAL_MOTION_SEARCH_RADIUS));
+    return true;
+}
+
+static bool GenerateInternalMotion(
+    DLSSNRFilter::Impl& impl,
+    bool resetHistory,
+    bool& motionHasHistory
+) noexcept {
+    motionHasHistory = impl.internalMotionHistoryValid && !resetHistory;
+    const InternalMotionConstants constants{
+        .inputWidth = impl.width,
+        .inputHeight = impl.height,
+        .guideWidth = impl.internalMotionGuideWidth,
+        .guideHeight = impl.internalMotionGuideHeight,
+        .guideToInputX = float(impl.width) /
+            float(std::max(1u, impl.internalMotionGuideWidth)),
+        .guideToInputY = float(impl.height) /
+            float(std::max(1u, impl.internalMotionGuideHeight)),
+        .hasHistory = motionHasHistory ? 1u : 0u
+    };
+    impl.context11->UpdateSubresource(
+        impl.internalMotionConstants11.get(), 0, nullptr, &constants, 0, 0);
+
+    ID3D11Buffer* constantBuffer = impl.internalMotionConstants11.get();
+    ID3D11Buffer* nullBuffer = nullptr;
+    ID3D11ShaderResourceView* nullSrvs[4]{};
+    ID3D11UnorderedAccessView* nullUavs[3]{};
+    ID3D11UnorderedAccessView* nullUav = nullptr;
+
+    // Same idea as NeuralScreen's GRAY path: first reduce the working colour
+    // frame to a small luminance image with an area average.
+    ID3D11ShaderResourceView* colorSrv = impl.internalMotionColorSrv11.get();
+    ID3D11UnorderedAccessView* grayUav = impl.internalMotionCurrentGrayUav11.get();
+    impl.context11->CSSetShader(impl.internalMotionGrayShader11.get(), nullptr, 0);
+    impl.context11->CSSetShaderResources(0, 1, &colorSrv);
+    impl.context11->CSSetUnorderedAccessViews(0, 1, &grayUav, nullptr);
+    impl.context11->CSSetConstantBuffers(0, 1, &constantBuffer);
+    impl.context11->Dispatch(
+        (impl.internalMotionGuideWidth + 7) / 8,
+        (impl.internalMotionGuideHeight + 7) / 8, 1);
+    impl.context11->CSSetShaderResources(0, 1, nullSrvs);
+    impl.context11->CSSetUnorderedAccessViews(0, 1, &nullUav, nullptr);
+
+    if (!motionHasHistory) {
+        const float zero[4]{};
+        impl.context11->ClearUnorderedAccessViewFloat(
+            impl.workerMotionUav11.get(), zero);
+        impl.context11->CopyResource(
+            impl.internalMotionPreviousGray11.get(),
+            impl.internalMotionCurrentGray11.get());
+        impl.internalMotionHistoryValid = true;
+        impl.context11->CSSetConstantBuffers(0, 1, &nullBuffer);
+        impl.context11->CSSetShader(nullptr, nullptr, 0);
+        return true;
+    }
+
+    ID3D11ShaderResourceView* flowSrvs[]{
+        impl.internalMotionCurrentGraySrv11.get(),
+        impl.internalMotionPreviousGraySrv11.get()
+    };
+    ID3D11UnorderedAccessView* coarseUav =
+        impl.internalMotionCoarseFlowUav11.get();
+    impl.context11->CSSetShader(
+        impl.internalMotionEstimateShader11.get(), nullptr, 0);
+    impl.context11->CSSetShaderResources(1, ARRAYSIZE(flowSrvs), flowSrvs);
+    impl.context11->CSSetUnorderedAccessViews(1, 1, &coarseUav, nullptr);
+    impl.context11->Dispatch(
+        (impl.internalMotionGuideWidth + 7) / 8,
+        (impl.internalMotionGuideHeight + 7) / 8, 1);
+    impl.context11->CSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
+    impl.context11->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
+
+    ID3D11ShaderResourceView* coarseSrv =
+        impl.internalMotionCoarseFlowSrv11.get();
+    ID3D11UnorderedAccessView* motionUav = impl.workerMotionUav11.get();
+    impl.context11->CSSetShader(
+        impl.internalMotionUpscaleShader11.get(), nullptr, 0);
+    impl.context11->CSSetShaderResources(3, 1, &coarseSrv);
+    impl.context11->CSSetUnorderedAccessViews(2, 1, &motionUav, nullptr);
+    impl.context11->Dispatch(
+        (impl.width + 7) / 8, (impl.height + 7) / 8, 1);
+    impl.context11->CSSetShaderResources(0, ARRAYSIZE(nullSrvs), nullSrvs);
+    impl.context11->CSSetUnorderedAccessViews(0, ARRAYSIZE(nullUavs), nullUavs, nullptr);
+    impl.context11->CSSetConstantBuffers(0, 1, &nullBuffer);
+    impl.context11->CSSetShader(nullptr, nullptr, 0);
+
+    // The next frame searches this image for the best matching neighbourhood.
+    impl.context11->CopyResource(
+        impl.internalMotionPreviousGray11.get(),
+        impl.internalMotionCurrentGray11.get());
+    ++impl.internalMotionFramesWithHistory;
+    return true;
 }
 
 static bool CreateCompositeOutput(
@@ -2155,8 +2559,9 @@ DLSSNRFilter::~DLSSNRFilter() = default;
 FrameGuidanceRequirements
 DLSSNRFilter::GetFrameGuidanceRequirements() const noexcept {
 	if (!_impl || _impl->disabled) return {};
-	// External-worker mode consumes Magpie's real optical-flow motion guidance.
-	// Depth still falls back to the zero guidance contract in the worker.
+	// The external worker has its own NeuralScreen-style motion provider. Do not
+	// ask FrameGuidanceService to initialize NVOF/FFX optical flow for this path.
+	if (_impl->workerMode) return {};
 	FrameGuidanceRequirements result{ .zero = true };
 	result.Add(_settings.motionRequest);
 	return result;
@@ -2340,9 +2745,10 @@ bool DLSSNRFilter::Initialize(
 			return false;
 		}
 
-		// In worker mode this helper is used only for producer-fence waits.
-		// The D3D12 resource opening/transition side stays inside nvngx.dll.
-		impl->guidanceInterop = std::make_unique<FrameGuidanceD3D12Interop>();
+		if (!CreateInternalMotionResources(*impl)) {
+			StopExternalWorker(*impl);
+			return false;
+		}
 
 		HRESULT hr = S_OK;
 		if (impl->useResolutionScaling) {
@@ -2384,8 +2790,8 @@ bool DLSSNRFilter::Initialize(
 			"sourceSize={}x{} sourceFormat={} inputSize={}x{} "
 			"inputResolutionScaling={} inputResolutionPercent={} "
 			"style={} intensity={} localTone={} localStructure={} skinStructure={} "
-			"autoMask={} uiCorrection={} guidance=shared-motion+worker-zero-depth "
-			"opticalFlowMethod={} opticalFlowQuality={} disabled=false",
+			"autoMask={} uiCorrection={} guidance=internal-neuralscreen-motion+worker-zero-depth "
+			"motionGuide={}x{} searchRadius={} frameGuidanceService=bypassed disabled=false",
 			impl->sourceWidth, impl->sourceHeight,
 			static_cast<uint32_t>(inputDesc.Format),
 			impl->width, impl->height,
@@ -2397,8 +2803,9 @@ bool DLSSNRFilter::Initialize(
 			_settings.skinStructureStrength,
 			_settings.useAutoMask,
 			_settings.uiCorrection,
-			static_cast<uint32_t>(_settings.motionRequest.method),
-			static_cast<uint32_t>(_settings.motionRequest.quality)));
+			impl->internalMotionGuideWidth,
+			impl->internalMotionGuideHeight,
+			INTERNAL_MOTION_SEARCH_RADIUS));
 		_impl = std::move(impl);
 		return true;
 	}
@@ -2735,40 +3142,16 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 
 		const auto guidancePrepareStart =
 			NativeBackendTiming::Now();
-		const FrameGuidanceView guidance = SelectGuidance(
-			context, _settings,
-			{ impl.sourceWidth, impl.sourceHeight });
-		if (!impl.guidanceInterop ||
-			!impl.guidanceInterop->WaitForProducer(
-				impl.context11, guidance)) {
-			return failWorker("worker-guidance-producer-wait");
+		bool motionHasHistory = false;
+		if (!GenerateInternalMotion(
+			impl, impl.resetHistory, motionHasHistory)) {
+			return failWorker("internal-motion");
 		}
-
-		FrameGuidanceView reducedGuidance;
-		const FrameGuidanceView* evaluateGuidance = &guidance;
-		if (impl.useResolutionScaling) {
-			if (!PrepareReducedGuidance(impl, guidance)) {
-				return failWorker("worker-guidance-downsample");
-			}
-			reducedGuidance = MakeReducedGuidance(impl, guidance);
-			evaluateGuidance = &reducedGuidance;
-		}
-
-		if (!evaluateGuidance->motion.texture ||
-			!impl.workerMotion11) {
-			return failWorker("worker-motion-missing");
-		}
-		impl.context11->CopyResource(
-			impl.workerMotion11.get(),
-			evaluateGuidance->motion.texture);
-		PublishWorkerMotionMetadata(
-			impl, evaluateGuidance->motion.metadata.validRegion);
-
-		const bool guidanceReset =
-			evaluateGuidance->requiresHistoryReset &&
-			impl.lastGuidanceResetFrameId != context.frameId;
+		const FrameGuidanceRegion motionRegion =
+			FrameGuidanceRegion::Full({ impl.width, impl.height });
+		PublishWorkerMotionMetadata(impl, motionRegion);
 		PublishWorkerSettings(
-			impl, _settings, impl.resetHistory || guidanceReset);
+			impl, _settings, impl.resetHistory || !motionHasHistory);
 		const double guidancePrepareMs =
 			NativeBackendTiming::ElapsedMilliseconds(
 				guidancePrepareStart);
@@ -2832,24 +3215,24 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 			NativeBackendTiming::ElapsedMilliseconds(
 				submitStart);
 
-		if (impl.evaluateCount == 1 ||
+		if (impl.evaluateCount <= 2 ||
 			(NativeBackendTiming::Enabled &&
 				(impl.evaluateCount <= 8 ||
 				 impl.evaluateCount % 120 == 0))) {
 			LogDlssnrStatus(fmt::format(
 				"DLSSNR STATUS: Feature=18 frameId={} evaluateCount={} "
 				"result={:#x} success={} failures={} "
-				"path=external-worker motionZero={} motionRegion={},{},{}x{} "
-				"disabled=false",
+				"path=external-worker motionZero={} motionSource=internal-neuralscreen "
+				"motionGuide={}x{} motionRegion={},{},{}x{} disabled=false",
 				context.frameId, impl.evaluateCount,
 				static_cast<uint32_t>(workerResult),
 				impl.evaluateSuccessCount,
 				impl.evaluateFailureCount,
-				evaluateGuidance->motion.metadata.isZero,
-				evaluateGuidance->motion.metadata.validRegion.x,
-				evaluateGuidance->motion.metadata.validRegion.y,
-				evaluateGuidance->motion.metadata.validRegion.width,
-				evaluateGuidance->motion.metadata.validRegion.height));
+				!motionHasHistory,
+				impl.internalMotionGuideWidth,
+				impl.internalMotionGuideHeight,
+				motionRegion.x, motionRegion.y,
+				motionRegion.width, motionRegion.height));
 		}
 
 		if constexpr (NativeBackendTiming::Enabled) {
@@ -2859,9 +3242,6 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 			impl.submitTimings.Add(submitMs);
 		}
 
-		if (guidanceReset) {
-			impl.lastGuidanceResetFrameId = context.frameId;
-		}
 		impl.resetHistory = false;
 		impl.residualParametersDirty = false;
 		impl.lastEvaluatedFrameId = context.frameId;
