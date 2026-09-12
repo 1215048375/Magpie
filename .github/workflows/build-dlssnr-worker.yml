@@ -24,6 +24,9 @@ jobs:
         with:
           python-version: '3.13'
 
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
       - name: Setup Conan
         run: pip install conan
 
