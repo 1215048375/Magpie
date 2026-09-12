@@ -610,6 +610,7 @@ struct DLSSNRFilter::Impl {
 	std::wstring workerSession;
 	wil::unique_handle workerInputSharedHandle;
 	wil::unique_handle workerOutputSharedHandle;
+	wil::unique_handle workerMotionSharedHandle;
 	wil::unique_handle workerFenceSharedHandle;
 	wil::unique_handle workerControlMapping;
 	wil::unique_handle workerReadyEvent;
@@ -627,6 +628,7 @@ struct DLSSNRFilter::Impl {
 	uint32_t nextCommandSlot = 0;
 	winrt::com_ptr<ID3D11Texture2D> sharedInput11;
 	winrt::com_ptr<ID3D11Texture2D> sharedOutput11;
+	winrt::com_ptr<ID3D11Texture2D> workerMotion11;
 	winrt::com_ptr<ID3D11ShaderResourceView> inputSrv11;
 	winrt::com_ptr<ID3D11ShaderResourceView> sharedInputSrv11;
 	winrt::com_ptr<ID3D11ShaderResourceView> sharedOutputSrv11;
@@ -1040,6 +1042,20 @@ static void PublishWorkerSettings(
 	InterlockedIncrement(&control->settingsRevision);
 }
 
+static void PublishWorkerMotionMetadata(
+	DLSSNRFilter::Impl& impl,
+	FrameGuidanceRegion region
+) noexcept {
+	auto* control = impl.workerControl;
+	if (!control) return;
+
+	control->motionBaseX = region.x;
+	control->motionBaseY = region.y;
+	control->motionWidth = region.width;
+	control->motionHeight = region.height;
+	MemoryBarrier();
+}
+
 static bool WaitForWorkerFence(
 	DLSSNRFilter::Impl& impl,
 	uint64_t value,
@@ -1106,6 +1122,7 @@ static void StopExternalWorker(DLSSNRFilter::Impl& impl) noexcept {
 	impl.workerStopEvent.reset();
 	impl.workerControlMapping.reset();
 	impl.workerFenceSharedHandle.reset();
+	impl.workerMotionSharedHandle.reset();
 	impl.workerOutputSharedHandle.reset();
 	impl.workerInputSharedHandle.reset();
 	impl.workerMode = false;
@@ -1152,6 +1169,16 @@ static bool StartExternalWorker(
 			OutputName(impl.workerSession),
 			impl.sharedOutput11,
 			impl.workerOutputSharedHandle)) {
+		return false;
+	}
+
+	D3D11_TEXTURE2D_DESC motionDesc = sharedDesc;
+	motionDesc.Format = DXGI_FORMAT_R16G16_FLOAT;
+	if (!CreateWorkerSharedTexture(
+		impl, motionDesc, false,
+		MotionName(impl.workerSession),
+		impl.workerMotion11,
+		impl.workerMotionSharedHandle)) {
 		return false;
 	}
 
@@ -1211,6 +1238,8 @@ static bool StartExternalWorker(
 		static_cast<LONG>(WorkerState::Starting);
 	impl.workerControl->resetHistory = 1;
 	PublishWorkerSettings(impl, settings, true);
+	PublishWorkerMotionMetadata(
+		impl, FrameGuidanceRegion::Full({ impl.width, impl.height }));
 
 	HANDLE ready = CreateEventW(
 		nullptr, TRUE, FALSE,
@@ -2126,9 +2155,8 @@ DLSSNRFilter::~DLSSNRFilter() = default;
 FrameGuidanceRequirements
 DLSSNRFilter::GetFrameGuidanceRequirements() const noexcept {
 	if (!_impl || _impl->disabled) return {};
-	// Worker v1 deliberately uses zero motion/depth internally. This matches the
-	// already-validated bridge path; real cross-process guidance is phase 2.
-	if (_impl->workerMode) return {};
+	// External-worker mode consumes Magpie's real optical-flow motion guidance.
+	// Depth still falls back to the zero guidance contract in the worker.
 	FrameGuidanceRequirements result{ .zero = true };
 	result.Add(_settings.motionRequest);
 	return result;
@@ -2312,6 +2340,10 @@ bool DLSSNRFilter::Initialize(
 			return false;
 		}
 
+		// In worker mode this helper is used only for producer-fence waits.
+		// The D3D12 resource opening/transition side stays inside nvngx.dll.
+		impl->guidanceInterop = std::make_unique<FrameGuidanceD3D12Interop>();
+
 		HRESULT hr = S_OK;
 		if (impl->useResolutionScaling) {
 			if (!CreateResolutionScalingResources(
@@ -2352,7 +2384,8 @@ bool DLSSNRFilter::Initialize(
 			"sourceSize={}x{} sourceFormat={} inputSize={}x{} "
 			"inputResolutionScaling={} inputResolutionPercent={} "
 			"style={} intensity={} localTone={} localStructure={} skinStructure={} "
-			"autoMask={} uiCorrection={} guidance=worker-zero disabled=false",
+			"autoMask={} uiCorrection={} guidance=shared-motion+worker-zero-depth "
+			"opticalFlowMethod={} opticalFlowQuality={} disabled=false",
 			impl->sourceWidth, impl->sourceHeight,
 			static_cast<uint32_t>(inputDesc.Format),
 			impl->width, impl->height,
@@ -2363,7 +2396,9 @@ bool DLSSNRFilter::Initialize(
 			_settings.localStructureStrength,
 			_settings.skinStructureStrength,
 			_settings.useAutoMask,
-			_settings.uiCorrection));
+			_settings.uiCorrection,
+			static_cast<uint32_t>(_settings.motionRequest.method),
+			static_cast<uint32_t>(_settings.motionRequest.quality)));
 		_impl = std::move(impl);
 		return true;
 	}
@@ -2698,8 +2733,45 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 			return succeeded;
 		}
 
+		const auto guidancePrepareStart =
+			NativeBackendTiming::Now();
+		const FrameGuidanceView guidance = SelectGuidance(
+			context, _settings,
+			{ impl.sourceWidth, impl.sourceHeight });
+		if (!impl.guidanceInterop ||
+			!impl.guidanceInterop->WaitForProducer(
+				impl.context11, guidance)) {
+			return failWorker("worker-guidance-producer-wait");
+		}
+
+		FrameGuidanceView reducedGuidance;
+		const FrameGuidanceView* evaluateGuidance = &guidance;
+		if (impl.useResolutionScaling) {
+			if (!PrepareReducedGuidance(impl, guidance)) {
+				return failWorker("worker-guidance-downsample");
+			}
+			reducedGuidance = MakeReducedGuidance(impl, guidance);
+			evaluateGuidance = &reducedGuidance;
+		}
+
+		if (!evaluateGuidance->motion.texture ||
+			!impl.workerMotion11) {
+			return failWorker("worker-motion-missing");
+		}
+		impl.context11->CopyResource(
+			impl.workerMotion11.get(),
+			evaluateGuidance->motion.texture);
+		PublishWorkerMotionMetadata(
+			impl, evaluateGuidance->motion.metadata.validRegion);
+
+		const bool guidanceReset =
+			evaluateGuidance->requiresHistoryReset &&
+			impl.lastGuidanceResetFrameId != context.frameId;
 		PublishWorkerSettings(
-			impl, _settings, impl.resetHistory);
+			impl, _settings, impl.resetHistory || guidanceReset);
+		const double guidancePrepareMs =
+			NativeBackendTiming::ElapsedMilliseconds(
+				guidancePrepareStart);
 
 		const uint64_t inputReady =
 			impl.fenceValue + 1;
@@ -2767,19 +2839,29 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 			LogDlssnrStatus(fmt::format(
 				"DLSSNR STATUS: Feature=18 frameId={} evaluateCount={} "
 				"result={:#x} success={} failures={} "
-				"path=external-worker disabled=false",
+				"path=external-worker motionZero={} motionRegion={},{},{}x{} "
+				"disabled=false",
 				context.frameId, impl.evaluateCount,
 				static_cast<uint32_t>(workerResult),
 				impl.evaluateSuccessCount,
-				impl.evaluateFailureCount));
+				impl.evaluateFailureCount,
+				evaluateGuidance->motion.metadata.isZero,
+				evaluateGuidance->motion.metadata.validRegion.x,
+				evaluateGuidance->motion.metadata.validRegion.y,
+				evaluateGuidance->motion.metadata.validRegion.width,
+				evaluateGuidance->motion.metadata.validRegion.height));
 		}
 
 		if constexpr (NativeBackendTiming::Enabled) {
 			impl.inputPrepareTimings.Add(inputPrepareMs);
+			impl.guidancePrepareTimings.Add(guidancePrepareMs);
 			impl.evaluateCpuTimings.Add(evaluateCpuMs);
 			impl.submitTimings.Add(submitMs);
 		}
 
+		if (guidanceReset) {
+			impl.lastGuidanceResetFrameId = context.frameId;
+		}
 		impl.resetHistory = false;
 		impl.residualParametersDirty = false;
 		impl.lastEvaluatedFrameId = context.frameId;

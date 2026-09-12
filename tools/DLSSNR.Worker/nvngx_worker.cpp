@@ -376,6 +376,10 @@ void SetEvaluateParameters(
 	ID3D12Resource* depth,
 	uint32_t width,
 	uint32_t height,
+	uint32_t motionBaseX,
+	uint32_t motionBaseY,
+	uint32_t motionWidth,
+	uint32_t motionHeight,
 	const EvaluateSettings& settings
 ) {
 	parameters->Set("DLSSNR.Color", color);
@@ -385,7 +389,10 @@ void SetEvaluateParameters(
 
 	SetSubrect(parameters, "DLSSNR.Color", width, height);
 	SetSubrect(parameters, "DLSSNR.Output", width, height);
-	SetSubrect(parameters, "DLSSNR.MVec", width, height);
+	parameters->Set("DLSSNR.MVecSubrectBaseX", motionBaseX);
+	parameters->Set("DLSSNR.MVecSubrectBaseY", motionBaseY);
+	parameters->Set("DLSSNR.MVecSubrectWidth", motionWidth);
+	parameters->Set("DLSSNR.MVecSubrectHeight", motionHeight);
 	SetSubrect(parameters, "DLSSNR.Depth", width, height);
 
 	parameters->Set("DLSSNR.MVecScaleX", 1.0f);
@@ -622,10 +629,13 @@ int RunWorker(const std::wstring& session) {
 	auto output =
 		OpenNamedSharedObject<ID3D12Resource>(
 			device.Get(), OutputName(session));
+	auto motion =
+		OpenNamedSharedObject<ID3D12Resource>(
+			device.Get(), MotionName(session));
 	auto sharedFence =
 		OpenNamedSharedObject<ID3D12Fence>(
 			device.Get(), FenceName(session));
-	if (!input || !output || !sharedFence) {
+	if (!input || !output || !motion || !sharedFence) {
 		return fail(E_HANDLE, 12);
 	}
 
@@ -781,15 +791,11 @@ int RunWorker(const std::wstring& session) {
 		return fail(E_FAIL, 21);
 	}
 
-	auto motion = CreateAuxTexture(
-		device.Get(),
-		DXGI_FORMAT_R16G16_FLOAT,
-		width, height);
 	auto depth = CreateAuxTexture(
 		device.Get(),
 		DXGI_FORMAT_R32_FLOAT,
 		width, height);
-	if (!motion || !depth) {
+	if (!depth) {
 		releaseFeature(feature);
 		snippetShutdown(device.Get());
 		FreeLibrary(snippet);
@@ -801,7 +807,7 @@ int RunWorker(const std::wstring& session) {
 	D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
 	heapDesc.Type =
 		D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
-	heapDesc.NumDescriptors = 2;
+	heapDesc.NumDescriptors = 1;
 	heapDesc.Flags =
 		D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
 
@@ -813,25 +819,10 @@ int RunWorker(const std::wstring& session) {
 		return fail(hr, 23);
 	}
 
-	const UINT descriptorStride =
-		device->GetDescriptorHandleIncrementSize(
-			D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
-	auto motionCpu =
+	auto depthCpu =
 		descriptorHeap->GetCPUDescriptorHandleForHeapStart();
-	auto motionGpu =
+	auto depthGpu =
 		descriptorHeap->GetGPUDescriptorHandleForHeapStart();
-	auto depthCpu = motionCpu;
-	auto depthGpu = motionGpu;
-	depthCpu.ptr += descriptorStride;
-	depthGpu.ptr += descriptorStride;
-
-	D3D12_UNORDERED_ACCESS_VIEW_DESC motionUav{};
-	motionUav.Format = DXGI_FORMAT_R16G16_FLOAT;
-	motionUav.ViewDimension =
-		D3D12_UAV_DIMENSION_TEXTURE2D;
-	device->CreateUnorderedAccessView(
-		motion.Get(), nullptr,
-		&motionUav, motionCpu);
 
 	D3D12_UNORDERED_ACCESS_VIEW_DESC depthUav{};
 	depthUav.Format = DXGI_FORMAT_R32_FLOAT;
@@ -852,31 +843,19 @@ int RunWorker(const std::wstring& session) {
 	commandList->SetDescriptorHeaps(1, heaps);
 	const float zero[4]{ 0, 0, 0, 0 };
 	commandList->ClearUnorderedAccessViewFloat(
-		motionGpu, motionCpu,
-		motion.Get(), zero, 0, nullptr);
-	commandList->ClearUnorderedAccessViewFloat(
 		depthGpu, depthCpu,
 		depth.Get(), zero, 0, nullptr);
 
-	std::array<D3D12_RESOURCE_BARRIER, 2>
-		guidanceBarriers{};
-	for (size_t i = 0; i < guidanceBarriers.size(); ++i) {
-		guidanceBarriers[i].Type =
-			D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		guidanceBarriers[i].Transition.Subresource =
-			D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
-		guidanceBarriers[i].Transition.StateBefore =
-			D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
-		guidanceBarriers[i].Transition.StateAfter =
-			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
-	}
-	guidanceBarriers[0].Transition.pResource =
-		motion.Get();
-	guidanceBarriers[1].Transition.pResource =
-		depth.Get();
-	commandList->ResourceBarrier(
-		static_cast<UINT>(guidanceBarriers.size()),
-		guidanceBarriers.data());
+	D3D12_RESOURCE_BARRIER depthBarrier{};
+	depthBarrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	depthBarrier.Transition.pResource = depth.Get();
+	depthBarrier.Transition.Subresource =
+		D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	depthBarrier.Transition.StateBefore =
+		D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+	depthBarrier.Transition.StateAfter =
+		D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+	commandList->ResourceBarrier(1, &depthBarrier);
 
 	hr = commandList->Close();
 	if (FAILED(hr)) return fail(hr, 25);
@@ -899,7 +878,7 @@ int RunWorker(const std::wstring& session) {
 		&control->lastResult,
 		static_cast<LONG>(NVSDK_NGX_Result_Success));
 	SetEvent(readyEvent);
-	Log("READY: Feature 18 initialized for %ux%u",
+	Log("READY: Feature 18 initialized for %ux%u motion=shared depth=zero",
 		width, height);
 
 	uint64_t inputReady = 1;
@@ -947,7 +926,7 @@ int RunWorker(const std::wstring& session) {
 			break;
 		}
 
-		D3D12_RESOURCE_BARRIER barriers[2]{};
+		D3D12_RESOURCE_BARRIER barriers[3]{};
 		barriers[0].Type =
 			D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		barriers[0].Transition = {
@@ -964,16 +943,40 @@ int RunWorker(const std::wstring& session) {
 			D3D12_RESOURCE_STATE_COMMON,
 			D3D12_RESOURCE_STATE_UNORDERED_ACCESS
 		};
+		barriers[2].Type =
+			D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barriers[2].Transition = {
+			motion.Get(),
+			D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES,
+			D3D12_RESOURCE_STATE_COMMON,
+			D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE
+		};
 		commandList->ResourceBarrier(
 			ARRAYSIZE(barriers), barriers);
 
 		const EvaluateSettings settings =
 			ReadSettings(control);
+		uint32_t motionBaseX = control->motionBaseX;
+		uint32_t motionBaseY = control->motionBaseY;
+		uint32_t motionWidth = control->motionWidth;
+		uint32_t motionHeight = control->motionHeight;
+		if (!motionWidth || !motionHeight ||
+			motionBaseX + motionWidth > width ||
+			motionBaseY + motionHeight > height) {
+			motionBaseX = 0;
+			motionBaseY = 0;
+			motionWidth = width;
+			motionHeight = height;
+		}
+
 		SetEvaluateParameters(
 			parameters,
 			input.Get(), output.Get(),
 			motion.Get(), depth.Get(),
-			width, height, settings);
+			width, height,
+			motionBaseX, motionBaseY,
+			motionWidth, motionHeight,
+			settings);
 
 		ngxResult = evaluateFeature(
 			commandList.Get(),

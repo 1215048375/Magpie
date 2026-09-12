@@ -8,7 +8,7 @@
 namespace Magpie::DLSSNRWorkerProtocol {
 
 inline constexpr uint32_t MAGIC = 0x4D4E5257u; // "MNRW"
-inline constexpr uint32_t VERSION = 1;
+inline constexpr uint32_t VERSION = 2;
 
 enum class WorkerState : LONG {
 	Starting = 0,
@@ -39,7 +39,10 @@ struct ControlBlock {
 	float skinStructureStrength = 0.0f;
 	uint32_t useAutoMask = 0;
 	uint32_t uiCorrection = 0;
-	uint32_t reserved1 = 0;
+	uint32_t motionBaseX = 0;
+	uint32_t motionBaseY = 0;
+	uint32_t motionWidth = 0;
+	uint32_t motionHeight = 0;
 };
 
 inline std::wstring ObjectName(
@@ -59,6 +62,10 @@ inline std::wstring InputName(std::wstring_view session) {
 
 inline std::wstring OutputName(std::wstring_view session) {
 	return ObjectName(session, L"Output");
+}
+
+inline std::wstring MotionName(std::wstring_view session) {
+	return ObjectName(session, L"Motion");
 }
 
 inline std::wstring FenceName(std::wstring_view session) {
