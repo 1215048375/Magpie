@@ -2300,7 +2300,7 @@ bool DLSSNRFilter::Initialize(
 		1u, static_cast<uint32_t>(std::lround(
 			double(inputDesc.Height) * double(resolutionPercent) / 100.0))) :
 		inputDesc.Height;
-\timpl->convertInputToRgba = inputDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+	impl->convertInputToRgba = inputDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
 
 	if constexpr (USE_EXTERNAL_DLSSNR_WORKER) {
 		D3D11_TEXTURE2D_DESC sharedDesc = outputDesc;
@@ -2655,7 +2655,7 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 	}
 	// A live upstream edit can change this input even for the same capture ID.
 	// Re-evaluate with fresh history instead of mixing it with the old image.
-\tif (impl.lastEvaluatedInputRevision != context.inputRevision) {
+	if (impl.lastEvaluatedInputRevision != context.inputRevision) {
 		impl.resetHistory = true;
 	}
 
