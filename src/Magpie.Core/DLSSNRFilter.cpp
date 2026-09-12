@@ -1019,6 +1019,7 @@ struct DLSSNRFilter::Impl {
 	float experimentalHdrScale = 1.0f;
 	bool useResolutionScaling = false;
 	bool coreRegistered = false;
+	bool directCoreInitialized = false;
 	bool directParameterBlock = false;
 	bool snippetInitialized = false;
 	bool snippetCallerHookInstalled = false;
@@ -1090,6 +1091,31 @@ NVSDK_NGX_Result CallSnippetInitSafely(
 		return function(
 			DLSSNR_SIGNED_SNIPPET_APPLICATION_ID, applicationDataPath,
 			device, NVSDK_NGX_Version_API, nullptr);
+	}, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
+}
+
+NVSDK_NGX_Result InitDirectCoreWithAppIdSafely(
+	const wchar_t* applicationDirectory,
+	ID3D12Device* device,
+	const NVSDK_NGX_FeatureCommonInfo* featureInfo,
+	DWORD* sehCode
+) noexcept {
+	return NgxRuntimeGuard::Invoke([&]() {
+		return NVSDK_NGX_D3D12_Init(
+			DLSSNR_SIGNED_SNIPPET_APPLICATION_ID,
+			applicationDirectory,
+			device,
+			featureInfo,
+			NVSDK_NGX_Version_API);
+	}, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
+}
+
+NVSDK_NGX_Result ShutdownDirectCoreSafely(
+	ID3D12Device* device,
+	DWORD* sehCode
+) noexcept {
+	return NgxRuntimeGuard::Invoke([&]() {
+		return NVSDK_NGX_D3D12_Shutdown1(device);
 	}, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
@@ -1430,6 +1456,19 @@ DLSSNRFilter::Impl::~Impl() {
 				"DLSSNR signed snippet DLL retained after NGX fault or caller IAT restoration failure");
 		}
 		snippetModule = nullptr;
+	}
+	if (directCoreInitialized && device12) {
+		DWORD sehCode = 0;
+		const NVSDK_NGX_Result result =
+			ShutdownDirectCoreSafely(device12.get(), &sehCode);
+		if (sehCode) {
+			Logger::Get().Warn(fmt::format(
+				"DLSSNR direct Core Shutdown1 raised SEH {:#x}", sehCode));
+		} else if (!NGXSucceeded(result)) {
+			Logger::Get().Warn(fmt::format(
+				"DLSSNR direct Core Shutdown1 failed ({:#x})", (uint32_t)result));
+		}
+		directCoreInitialized = false;
 	}
 	if (coreRegistered && coreOwner) {
 		coreOwner->Release("DLSSNR");
@@ -2327,7 +2366,34 @@ bool DLSSNRFilter::Initialize(
 		return false;
 	}
 	Logger::Get().Info(
-		"DLSSNR direct runtime: private D3D12 device created; shared NGX Core init skipped");
+		"DLSSNR direct runtime: private D3D12 device created");
+
+	// Initialize the NGX loader with the signed DLSSNR application id rather
+	// than the generic ProjectID path. The loader owns NVSDK_NGX_Parameter
+	// blocks; the feature snippet itself does not export their allocator.
+	const std::wstring featurePath = applicationDirectory.wstring();
+	const wchar_t* featurePaths[]{ featurePath.c_str() };
+	NVSDK_NGX_FeatureCommonInfo featureInfo{};
+	featureInfo.PathListInfo.Path = featurePaths;
+	featureInfo.PathListInfo.Length = 1;
+	DWORD coreSehCode = 0;
+	const NVSDK_NGX_Result coreInitResult = InitDirectCoreWithAppIdSafely(
+		applicationDirectory.c_str(), impl->device12.get(), &featureInfo, &coreSehCode);
+	if (coreSehCode) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR direct Core Init(AppId) raised SEH {:#x}", coreSehCode));
+		return false;
+	}
+	if (!NGXSucceeded(coreInitResult)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR direct Core Init(AppId) failed ({:#x})",
+			(uint32_t)coreInitResult));
+		return false;
+	}
+	impl->directCoreInitialized = true;
+	Logger::Get().Info(
+		"DLSSNR direct runtime: NGX Core initialized with signed application id");
+
 	hr = S_OK;
 	D3D12_COMMAND_QUEUE_DESC queueDesc{};
 	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
