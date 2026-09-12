@@ -1,0 +1,1504 @@
+diff --git a/tools/DLSSNR.WorkerBridge/bridge_protocol.h b/tools/DLSSNR.WorkerBridge/bridge_protocol.h
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.WorkerBridge/bridge_protocol.h
+@@ -0,0 +1,30 @@
++#pragma once
++
++#include <Windows.h>
++#include <cstdint>
++#include <string>
++
++namespace MagpieDlssnrBridge {
++
++constexpr uint64_t kInputReadyFenceValue = 1;
++constexpr uint64_t kOutputReadyFenceValue = 2;
++
++inline std::wstring MakeObjectName(
++    const wchar_t* kind,
++    const std::wstring& session) {
++    return std::wstring(L"Local\\MagpieDLSSNR_") + session + L"_" + kind;
++}
++
++inline std::wstring InputName(const std::wstring& session) {
++    return MakeObjectName(L"Input", session);
++}
++
++inline std::wstring OutputName(const std::wstring& session) {
++    return MakeObjectName(L"Output", session);
++}
++
++inline std::wstring FenceName(const std::wstring& session) {
++    return MakeObjectName(L"Fence", session);
++}
++
++}
+
+diff --git a/tools/DLSSNR.WorkerBridge/nvngx_worker_bridge.cpp b/tools/DLSSNR.WorkerBridge/nvngx_worker_bridge.cpp
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.WorkerBridge/nvngx_worker_bridge.cpp
+@@ -0,0 +1,763 @@
++// Magpie DLSSNR cross-process bridge probe.
++//
++// This executable PE is intentionally named nvngx.dll.
++// It opens D3D11-created NT-shared textures/fence by name, runs one DLSSNR
++// Feature 18 evaluation on D3D12, then signals the shared fence.
++//
++// Runtime directory:
++//   nvngx.dll
++//   nvngx_dlssnr.dll
++//   magpie-dlssnr-bridge-client.exe
++//
++// This is a transport proof, not yet the production Magpie backend.
++
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <Windows.h>
++#include <d3d12.h>
++#include <dxgi1_6.h>
++#include <wrl/client.h>
++
++#include <nvsdk_ngx.h>
++#include <nvsdk_ngx_defs.h>
++
++#include "bridge_protocol.h"
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <cstdarg>
++#include <cstdio>
++#include <cwctype>
++#include <cstring>
++#include <filesystem>
++#include <mutex>
++#include <string>
++#include <vector>
++
++using Microsoft::WRL::ComPtr;
++using namespace MagpieDlssnrBridge;
++
++namespace {
++
++constexpr unsigned long long kDlssNrApplicationId = 0x0876232Cull;
++constexpr NVSDK_NGX_Feature kFeatureDlssNr =
++    static_cast<NVSDK_NGX_Feature>(18);
++
++constexpr uint32_t kNvapiIdGpuGetArchInfo = 0xD8265D24u;
++constexpr uint32_t kArchAmpere = 0x0170u;
++constexpr uint32_t kArchBlackwell2 = 0x01B0u;
++constexpr size_t kHookSize = 12;
++
++FILE* g_log = nullptr;
++
++void Log(const char* fmt, ...) {
++    va_list args;
++    va_start(args, fmt);
++    if (g_log) {
++        vfprintf(g_log, fmt, args);
++        fputc('\n', g_log);
++        fflush(g_log);
++    }
++    va_end(args);
++
++    va_start(args, fmt);
++    vprintf(fmt, args);
++    fputc('\n', stdout);
++    fflush(stdout);
++    va_end(args);
++}
++
++std::filesystem::path ExePath() {
++    std::wstring buf(32768, L'\0');
++    DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
++    if (!n || n >= buf.size()) return {};
++    buf.resize(n);
++    return std::filesystem::path(buf);
++}
++
++struct NvGpuArchInfoCompat {
++    uint32_t version;
++    uint32_t architecture;
++    uint32_t implementation;
++    uint32_t revision;
++};
++
++using NvApiQueryInterfaceFn = void* (__cdecl*)(uint32_t);
++using NvApiGpuGetArchInfoFn = int (__cdecl*)(void*, NvGpuArchInfoCompat*);
++
++std::mutex g_archMutex;
++NvApiGpuGetArchInfoFn g_archReal = nullptr;
++std::array<uint8_t, kHookSize> g_archOriginal{};
++bool g_archPatched = false;
++std::atomic<bool> g_archLogged = false;
++
++int __cdecl HookedGpuGetArchInfo(void* gpu, NvGpuArchInfoCompat* info);
++
++bool SetArchHook(bool enable) {
++    if (!g_archReal) return false;
++    auto* target = reinterpret_cast<uint8_t*>(
++        reinterpret_cast<uintptr_t>(g_archReal));
++
++    DWORD oldProtect = 0;
++    if (!VirtualProtect(target, kHookSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
++        return false;
++    }
++
++    if (enable) {
++        std::array<uint8_t, kHookSize> patch{
++            0x48, 0xB8, 0,0,0,0,0,0,0,0, 0xFF, 0xE0
++        };
++        const uint64_t handler =
++            reinterpret_cast<uint64_t>(&HookedGpuGetArchInfo);
++        std::memcpy(patch.data() + 2, &handler, sizeof(handler));
++        std::memcpy(target, patch.data(), patch.size());
++        g_archPatched = true;
++    } else {
++        std::memcpy(target, g_archOriginal.data(), g_archOriginal.size());
++        g_archPatched = false;
++    }
++
++    FlushInstructionCache(GetCurrentProcess(), target, kHookSize);
++    DWORD ignored = 0;
++    VirtualProtect(target, kHookSize, oldProtect, &ignored);
++    return true;
++}
++
++int __cdecl HookedGpuGetArchInfo(void* gpu, NvGpuArchInfoCompat* info) {
++    std::lock_guard lock(g_archMutex);
++    if (!SetArchHook(false)) return -1;
++
++    const int status = g_archReal ? g_archReal(gpu, info) : -1;
++    SetArchHook(true);
++
++    if (status == 0 && info) {
++        const uint32_t real = info->architecture;
++        if (real == kArchAmpere) {
++            info->architecture = kArchBlackwell2;
++            if (!g_archLogged.exchange(true)) {
++                Log("ARCH: real=0x%03x spoofed=0x%03x",
++                    real, info->architecture);
++            }
++        } else if (!g_archLogged.exchange(true)) {
++            Log("ARCH: observed=0x%03x (not rewritten)", real);
++        }
++    }
++
++    return status;
++}
++
++class ScopedArchSpoof {
++public:
++    bool Install() {
++        module_ = LoadLibraryW(L"nvapi64.dll");
++        if (!module_) {
++            Log("ARCH: LoadLibrary(nvapi64.dll) failed: %lu", GetLastError());
++            return false;
++        }
++
++        auto query = reinterpret_cast<NvApiQueryInterfaceFn>(
++            GetProcAddress(module_, "nvapi_QueryInterface"));
++        if (!query) {
++            Log("ARCH: nvapi_QueryInterface missing");
++            return false;
++        }
++
++        g_archReal = reinterpret_cast<NvApiGpuGetArchInfoFn>(
++            query(kNvapiIdGpuGetArchInfo));
++        if (!g_archReal) {
++            Log("ARCH: NvAPI_GPU_GetArchInfo lookup failed");
++            return false;
++        }
++
++        std::memcpy(
++            g_archOriginal.data(),
++            reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_archReal)),
++            g_archOriginal.size());
++
++        if (!SetArchHook(true)) {
++            Log("ARCH: patch failed");
++            return false;
++        }
++
++        installed_ = true;
++        Log("ARCH: hook installed");
++        return true;
++    }
++
++    ~ScopedArchSpoof() {
++        if (installed_ && g_archReal && g_archPatched) {
++            std::lock_guard lock(g_archMutex);
++            SetArchHook(false);
++            Log("ARCH: hook removed");
++        }
++        g_archReal = nullptr;
++        if (module_) FreeLibrary(module_);
++    }
++
++private:
++    HMODULE module_ = nullptr;
++    bool installed_ = false;
++};
++
++ComPtr<IDXGIAdapter1> PickNvidiaAdapter() {
++    ComPtr<IDXGIFactory6> factory;
++    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return {};
++
++    for (UINT i = 0;; ++i) {
++        ComPtr<IDXGIAdapter1> adapter;
++        const HRESULT hr = factory->EnumAdapterByGpuPreference(
++            i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
++            IID_PPV_ARGS(&adapter));
++        if (hr == DXGI_ERROR_NOT_FOUND) break;
++        if (FAILED(hr)) continue;
++
++        DXGI_ADAPTER_DESC1 desc{};
++        if (FAILED(adapter->GetDesc1(&desc))) continue;
++        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
++
++        if (desc.VendorId == 0x10DE) {
++            char name[256]{};
++            WideCharToMultiByte(
++                CP_UTF8, 0, desc.Description, -1,
++                name, static_cast<int>(sizeof(name)), nullptr, nullptr);
++            Log("DXGI: selected %s vendor=0x%04x device=0x%04x",
++                name, desc.VendorId, desc.DeviceId);
++            return adapter;
++        }
++    }
++    return {};
++}
++
++template <typename T>
++T Export(HMODULE module, const char* name) {
++    return reinterpret_cast<T>(GetProcAddress(module, name));
++}
++
++using SnippetInitExtFn = NVSDK_NGX_Result (NVSDK_CONV*)(
++    unsigned long long, const wchar_t*, ID3D12Device*,
++    NVSDK_NGX_Version, const NVSDK_NGX_Parameter*);
++using SnippetCreateFeatureFn = NVSDK_NGX_Result (NVSDK_CONV*)(
++    ID3D12GraphicsCommandList*, NVSDK_NGX_Feature,
++    NVSDK_NGX_Parameter*, NVSDK_NGX_Handle**);
++using SnippetEvaluateFeatureFn = NVSDK_NGX_Result (NVSDK_CONV*)(
++    ID3D12GraphicsCommandList*, const NVSDK_NGX_Handle*,
++    const NVSDK_NGX_Parameter*, PFN_NVSDK_NGX_ProgressCallback);
++using SnippetReleaseFeatureFn =
++    NVSDK_NGX_Result (NVSDK_CONV*)(NVSDK_NGX_Handle*);
++using SnippetShutdownFn =
++    NVSDK_NGX_Result (NVSDK_CONV*)(ID3D12Device*);
++
++NVSDK_NGX_Result NVSDK_CONV ScalingRatioCallback(
++    NVSDK_NGX_Parameter* parameters) {
++    if (!parameters) return NVSDK_NGX_Result_FAIL_InvalidParameter;
++    parameters->Set("DLSSNR.ScalingRatio", 1.0f);
++    return NVSDK_NGX_Result_Success;
++}
++
++void SetSubrect(
++    NVSDK_NGX_Parameter* p,
++    const char* prefix,
++    uint32_t width,
++    uint32_t height) {
++    std::string baseX = std::string(prefix) + "SubrectBaseX";
++    std::string baseY = std::string(prefix) + "SubrectBaseY";
++    std::string w = std::string(prefix) + "SubrectWidth";
++    std::string h = std::string(prefix) + "SubrectHeight";
++    p->Set(baseX.c_str(), 0u);
++    p->Set(baseY.c_str(), 0u);
++    p->Set(w.c_str(), width);
++    p->Set(h.c_str(), height);
++}
++
++void SetCreateParameters(
++    NVSDK_NGX_Parameter* p,
++    uint32_t width,
++    uint32_t height) {
++    p->Set("DLSSNR.Width", width);
++    p->Set("DLSSNR.Height", height);
++    p->Set("DLSSNR.InputWidth", width);
++    p->Set("DLSSNR.InputHeight", height);
++    p->Set("DLSSNR.OutputWidth", width);
++    p->Set("DLSSNR.OutputHeight", height);
++    p->Set("DLSSNR.Output.Width", width);
++    p->Set("DLSSNR.Output.Height", height);
++    p->Set("DLSSNR.Upscaling", 0u);
++    p->Set("DLSSNR.Scale", 1.0f);
++    p->Set("DLSSNR.ScalingRatio", 1.0f);
++    p->Set(
++        "DLSSNRComputeScalingRatioCallback",
++        reinterpret_cast<void*>(
++            reinterpret_cast<uintptr_t>(&ScalingRatioCallback)));
++    p->Set("DLSSNR.Hint.Render.Preset", 0);
++
++    p->Set(NVSDK_NGX_Parameter_Width, width);
++    p->Set(NVSDK_NGX_Parameter_Height, height);
++    p->Set(
++        NVSDK_NGX_Parameter_PerfQualityValue,
++        static_cast<int>(NVSDK_NGX_PerfQuality_Value_Balanced));
++    p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
++    p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
++}
++
++void SetEvaluateParameters(
++    NVSDK_NGX_Parameter* p,
++    ID3D12Resource* color,
++    ID3D12Resource* output,
++    ID3D12Resource* motion,
++    ID3D12Resource* depth,
++    uint32_t width,
++    uint32_t height) {
++    p->Set("DLSSNR.Color", color);
++    p->Set("DLSSNR.Output", output);
++    p->Set("DLSSNR.MVec", motion);
++    p->Set("DLSSNR.Depth", depth);
++
++    SetSubrect(p, "DLSSNR.Color", width, height);
++    SetSubrect(p, "DLSSNR.Output", width, height);
++    SetSubrect(p, "DLSSNR.MVec", width, height);
++    SetSubrect(p, "DLSSNR.Depth", width, height);
++
++    p->Set("DLSSNR.MVecScaleX", 1.0f);
++    p->Set("DLSSNR.MVecScaleY", 1.0f);
++    p->Set("DLSSNR.DepthInverted", 1);
++    p->Set("DLSS.Indicator.Invert.X.Axis", 0);
++    p->Set("DLSS.Indicator.Invert.Y.Axis", 0);
++    p->Set("DLSSNR.Enabled", 1);
++    p->Set("DLSSNR.Reset", 1);
++
++    // Neutral/low-risk settings for the transport probe.
++    p->Set("DLSSNR.Style", 1);
++    p->Set("DLSSNR.Intensity", 1.0f);
++    p->Set("DLSSNR.LocalToneStrength", 1.0f);
++    p->Set("DLSSNR.LocalStructureStrength", 1.0f);
++    p->Set("DLSSNR.SkinStructureStrength", 1.0f);
++    p->Set("DLSSNR.UseAutoMask", 1);
++    p->Set("DLSSNR.UICorrection", 0);
++}
++
++ComPtr<ID3D12Resource> CreateAuxTexture(
++    ID3D12Device* device,
++    DXGI_FORMAT format,
++    uint32_t width,
++    uint32_t height) {
++    D3D12_HEAP_PROPERTIES heap{};
++    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++
++    D3D12_RESOURCE_DESC desc{};
++    desc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    desc.Width = width;
++    desc.Height = height;
++    desc.DepthOrArraySize = 1;
++    desc.MipLevels = 1;
++    desc.Format = format;
++    desc.SampleDesc.Count = 1;
++    desc.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    desc.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++
++    ComPtr<ID3D12Resource> resource;
++    if (FAILED(device->CreateCommittedResource(
++            &heap,
++            D3D12_HEAP_FLAG_NONE,
++            &desc,
++            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++            nullptr,
++            IID_PPV_ARGS(&resource)))) {
++        return {};
++    }
++    return resource;
++}
++
++bool WaitQueueIdle(ID3D12Device* device, ID3D12CommandQueue* queue) {
++    ComPtr<ID3D12Fence> fence;
++    if (FAILED(device->CreateFence(
++            0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
++        return false;
++    }
++    HANDLE eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    if (!eventHandle) return false;
++
++    bool ok = false;
++    if (SUCCEEDED(queue->Signal(fence.Get(), 1)) &&
++        SUCCEEDED(fence->SetEventOnCompletion(1, eventHandle))) {
++        ok = WaitForSingleObject(eventHandle, 10000) == WAIT_OBJECT_0;
++    }
++    CloseHandle(eventHandle);
++    return ok;
++}
++
++template <typename T>
++ComPtr<T> OpenNamedSharedObject(
++    ID3D12Device* device,
++    const std::wstring& name) {
++    HANDLE handle = nullptr;
++    HRESULT hr = device->OpenSharedHandleByName(
++        name.c_str(), GENERIC_ALL, &handle);
++    if (FAILED(hr) || !handle) {
++        Log("SHARE: OpenSharedHandleByName(%ls) failed hr=0x%08x",
++            name.c_str(), static_cast<unsigned>(hr));
++        return {};
++    }
++
++    ComPtr<T> object;
++    hr = device->OpenSharedHandle(handle, IID_PPV_ARGS(&object));
++    CloseHandle(handle);
++    if (FAILED(hr)) {
++        Log("SHARE: OpenSharedHandle(%ls) failed hr=0x%08x",
++            name.c_str(), static_cast<unsigned>(hr));
++        return {};
++    }
++
++    Log("SHARE: opened %ls", name.c_str());
++    return object;
++}
++
++int RunBridge(
++    const std::wstring& session,
++    uint32_t width,
++    uint32_t height) {
++    const auto exe = ExePath();
++    if (exe.empty()) {
++        Log("FATAL: GetModuleFileNameW failed");
++        return 2;
++    }
++    const auto dir = exe.parent_path();
++
++    std::wstring lower = exe.filename().wstring();
++    for (auto& c : lower) c = static_cast<wchar_t>(towlower(c));
++    if (lower.find(L"nvngx.dll") == std::wstring::npos) {
++        Log("FATAL: process image must contain nvngx.dll");
++        return 3;
++    }
++
++    const auto snippetPath = dir / L"nvngx_dlssnr.dll";
++    if (!std::filesystem::exists(snippetPath)) {
++        Log("FATAL: missing %ls", snippetPath.c_str());
++        return 4;
++    }
++
++    Log("BRIDGE: session=%ls size=%ux%u", session.c_str(), width, height);
++
++    ScopedArchSpoof arch;
++    if (!arch.Install()) return 5;
++
++    auto adapter = PickNvidiaAdapter();
++    if (!adapter) return 6;
++
++    ComPtr<ID3D12Device> device;
++    HRESULT hr = D3D12CreateDevice(
++        adapter.Get(), D3D_FEATURE_LEVEL_11_0, IID_PPV_ARGS(&device));
++    if (FAILED(hr)) {
++        Log("D3D12: CreateDevice failed hr=0x%08x", static_cast<unsigned>(hr));
++        return 7;
++    }
++
++    auto input = OpenNamedSharedObject<ID3D12Resource>(
++        device.Get(), InputName(session));
++    auto output = OpenNamedSharedObject<ID3D12Resource>(
++        device.Get(), OutputName(session));
++    auto sharedFence = OpenNamedSharedObject<ID3D12Fence>(
++        device.Get(), FenceName(session));
++    if (!input || !output || !sharedFence) return 8;
++
++    D3D12_RESOURCE_DESC inDesc = input->GetDesc();
++    D3D12_RESOURCE_DESC outDesc = output->GetDesc();
++    Log("SHARE: input fmt=%u %llux%u output fmt=%u %llux%u",
++        static_cast<unsigned>(inDesc.Format),
++        static_cast<unsigned long long>(inDesc.Width), inDesc.Height,
++        static_cast<unsigned>(outDesc.Format),
++        static_cast<unsigned long long>(outDesc.Width), outDesc.Height);
++
++    D3D12_COMMAND_QUEUE_DESC qd{};
++    qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++
++    ComPtr<ID3D12CommandQueue> queue;
++    ComPtr<ID3D12CommandAllocator> allocator;
++    ComPtr<ID3D12GraphicsCommandList> list;
++    hr = device->CreateCommandQueue(&qd, IID_PPV_ARGS(&queue));
++    if (SUCCEEDED(hr)) {
++        hr = device->CreateCommandAllocator(
++            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator));
++    }
++    if (SUCCEEDED(hr)) {
++        hr = device->CreateCommandList(
++            0, D3D12_COMMAND_LIST_TYPE_DIRECT,
++            allocator.Get(), nullptr, IID_PPV_ARGS(&list));
++    }
++    if (FAILED(hr)) {
++        Log("D3D12: command objects failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 9;
++    }
++
++    NVSDK_NGX_Result ngx = NVSDK_NGX_D3D12_Init(
++        kDlssNrApplicationId, dir.c_str(), device.Get());
++    Log("NGX CORE: Init -> 0x%08x", static_cast<unsigned>(ngx));
++    if (ngx != NVSDK_NGX_Result_Success) return 10;
++
++    NVSDK_NGX_Parameter* params = nullptr;
++    ngx = NVSDK_NGX_D3D12_GetCapabilityParameters(&params);
++    Log("NGX CORE: GetCapabilityParameters -> 0x%08x params=%p",
++        static_cast<unsigned>(ngx), static_cast<void*>(params));
++    if (ngx != NVSDK_NGX_Result_Success || !params) {
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 11;
++    }
++
++    HMODULE snippet = LoadLibraryExW(
++        snippetPath.c_str(), nullptr,
++        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
++        LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
++    if (!snippet) {
++        Log("SNIPPET: LoadLibrary failed win32=%lu", GetLastError());
++        NVSDK_NGX_D3D12_DestroyParameters(params);
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 12;
++    }
++
++    auto initExt = Export<SnippetInitExtFn>(
++        snippet, "NVSDK_NGX_D3D12_Init_Ext");
++    auto createFeature = Export<SnippetCreateFeatureFn>(
++        snippet, "NVSDK_NGX_D3D12_CreateFeature");
++    auto evaluateFeature = Export<SnippetEvaluateFeatureFn>(
++        snippet, "NVSDK_NGX_D3D12_EvaluateFeature");
++    auto releaseFeature = Export<SnippetReleaseFeatureFn>(
++        snippet, "NVSDK_NGX_D3D12_ReleaseFeature");
++    auto snippetShutdown = Export<SnippetShutdownFn>(
++        snippet, "NVSDK_NGX_D3D12_Shutdown1");
++
++    if (!initExt || !createFeature || !evaluateFeature ||
++        !releaseFeature || !snippetShutdown) {
++        Log("SNIPPET: required exports incomplete");
++        FreeLibrary(snippet);
++        NVSDK_NGX_D3D12_DestroyParameters(params);
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 13;
++    }
++
++    ngx = initExt(
++        kDlssNrApplicationId, dir.c_str(), device.Get(),
++        NVSDK_NGX_Version_API, params);
++    Log("SNIPPET: Init_Ext -> 0x%08x", static_cast<unsigned>(ngx));
++    if (ngx != NVSDK_NGX_Result_Success) {
++        FreeLibrary(snippet);
++        NVSDK_NGX_D3D12_DestroyParameters(params);
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 14;
++    }
++
++    SetCreateParameters(params, width, height);
++
++    NVSDK_NGX_Handle* feature = nullptr;
++    ngx = createFeature(
++        list.Get(), kFeatureDlssNr, params, &feature);
++    Log("SNIPPET: CreateFeature(18) -> 0x%08x handle=%p",
++        static_cast<unsigned>(ngx), static_cast<void*>(feature));
++    if (ngx != NVSDK_NGX_Result_Success || !feature) {
++        snippetShutdown(device.Get());
++        FreeLibrary(snippet);
++        NVSDK_NGX_D3D12_DestroyParameters(params);
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 15;
++    }
++
++    hr = list->Close();
++    if (FAILED(hr)) {
++        Log("D3D12: close create list failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 16;
++    }
++    {
++        ID3D12CommandList* lists[]{ list.Get() };
++        queue->ExecuteCommandLists(1, lists);
++    }
++    if (!WaitQueueIdle(device.Get(), queue.Get())) {
++        Log("D3D12: create-feature queue wait timed out");
++        return 17;
++    }
++
++    auto motion = CreateAuxTexture(
++        device.Get(), DXGI_FORMAT_R16G16_FLOAT, width, height);
++    auto depth = CreateAuxTexture(
++        device.Get(), DXGI_FORMAT_R32_FLOAT, width, height);
++    if (!motion || !depth) {
++        Log("D3D12: auxiliary texture creation failed");
++        return 18;
++    }
++
++    // Descriptor heap used only to clear the synthetic guidance textures.
++    D3D12_DESCRIPTOR_HEAP_DESC heapDesc{};
++    heapDesc.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
++    heapDesc.NumDescriptors = 2;
++    heapDesc.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
++
++    ComPtr<ID3D12DescriptorHeap> heap;
++    hr = device->CreateDescriptorHeap(&heapDesc, IID_PPV_ARGS(&heap));
++    if (FAILED(hr)) {
++        Log("D3D12: descriptor heap failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 19;
++    }
++
++    const UINT stride = device->GetDescriptorHandleIncrementSize(
++        D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
++    auto cpu0 = heap->GetCPUDescriptorHandleForHeapStart();
++    auto gpu0 = heap->GetGPUDescriptorHandleForHeapStart();
++    auto cpu1 = cpu0;
++    cpu1.ptr += stride;
++    auto gpu1 = gpu0;
++    gpu1.ptr += stride;
++
++    D3D12_UNORDERED_ACCESS_VIEW_DESC mvUav{};
++    mvUav.Format = DXGI_FORMAT_R16G16_FLOAT;
++    mvUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++    device->CreateUnorderedAccessView(motion.Get(), nullptr, &mvUav, cpu0);
++
++    D3D12_UNORDERED_ACCESS_VIEW_DESC depthUav{};
++    depthUav.Format = DXGI_FORMAT_R32_FLOAT;
++    depthUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++    device->CreateUnorderedAccessView(depth.Get(), nullptr, &depthUav, cpu1);
++
++    hr = allocator->Reset();
++    if (SUCCEEDED(hr)) {
++        hr = list->Reset(allocator.Get(), nullptr);
++    }
++    if (FAILED(hr)) {
++        Log("D3D12: reset evaluate list failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 20;
++    }
++
++    ID3D12DescriptorHeap* heaps[]{ heap.Get() };
++    list->SetDescriptorHeaps(1, heaps);
++
++    const float zero[4]{ 0, 0, 0, 0 };
++    const float one[4]{ 1, 1, 1, 1 };
++    list->ClearUnorderedAccessViewFloat(
++        gpu0, cpu0, motion.Get(), zero, 0, nullptr);
++    list->ClearUnorderedAccessViewFloat(
++        gpu1, cpu1, depth.Get(), one, 0, nullptr);
++
++    // Input is produced by D3D11 before fence value 1. Output returns to COMMON
++    // before signaling value 2 so the D3D11 side can consume it.
++    hr = queue->Wait(sharedFence.Get(), kInputReadyFenceValue);
++    if (FAILED(hr)) {
++        Log("FENCE: queue wait input failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 21;
++    }
++
++    std::array<D3D12_RESOURCE_BARRIER, 4> barriers{};
++    auto transition = [](ID3D12Resource* r,
++                         D3D12_RESOURCE_STATES before,
++                         D3D12_RESOURCE_STATES after) {
++        D3D12_RESOURCE_BARRIER b{};
++        b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++        b.Transition.pResource = r;
++        b.Transition.Subresource =
++            D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++        b.Transition.StateBefore = before;
++        b.Transition.StateAfter = after;
++        return b;
++    };
++
++    barriers[0] = transition(
++        input.Get(), D3D12_RESOURCE_STATE_COMMON,
++        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    barriers[1] = transition(
++        output.Get(), D3D12_RESOURCE_STATE_COMMON,
++        D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
++    barriers[2] = transition(
++        motion.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    barriers[3] = transition(
++        depth.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++        D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE);
++    list->ResourceBarrier(
++        static_cast<UINT>(barriers.size()), barriers.data());
++
++    SetEvaluateParameters(
++        params, input.Get(), output.Get(),
++        motion.Get(), depth.Get(), width, height);
++
++    ngx = evaluateFeature(
++        list.Get(), feature, params, nullptr);
++    Log("SNIPPET: EvaluateFeature -> 0x%08x",
++        static_cast<unsigned>(ngx));
++
++    // Only shared resources need to return to COMMON for the client.
++    std::swap(
++        barriers[0].Transition.StateBefore,
++        barriers[0].Transition.StateAfter);
++    std::swap(
++        barriers[1].Transition.StateBefore,
++        barriers[1].Transition.StateAfter);
++    list->ResourceBarrier(2, barriers.data());
++
++    hr = list->Close();
++    if (FAILED(hr)) {
++        Log("D3D12: close evaluate list failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 22;
++    }
++
++    {
++        ID3D12CommandList* lists[]{ list.Get() };
++        queue->ExecuteCommandLists(1, lists);
++    }
++
++    hr = queue->Signal(sharedFence.Get(), kOutputReadyFenceValue);
++    if (FAILED(hr)) {
++        Log("FENCE: signal output failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 23;
++    }
++
++    Log("BRIDGE: output signaled fence=%llu",
++        static_cast<unsigned long long>(kOutputReadyFenceValue));
++
++    // The shared fence guarantees the evaluation command list completed before
++    // the client reads output. We can now tear down.
++    WaitQueueIdle(device.Get(), queue.Get());
++
++    releaseFeature(feature);
++    snippetShutdown(device.Get());
++    FreeLibrary(snippet);
++    NVSDK_NGX_D3D12_DestroyParameters(params);
++    NVSDK_NGX_D3D12_Shutdown1(device.Get());
++
++    Log("SUCCESS: cross-process shared-texture Evaluate completed");
++    return ngx == NVSDK_NGX_Result_Success ? 0 : 30;
++}
++
++} // namespace
++
++int wmain(int argc, wchar_t** argv) {
++    const auto exe = ExePath();
++    const auto logPath =
++        (exe.empty() ? std::filesystem::path(L".") : exe.parent_path()) /
++        L"magpie-dlssnr-worker-bridge.log";
++    _wfopen_s(&g_log, logPath.c_str(), L"wb");
++
++    Log("=== Magpie DLSSNR worker bridge probe ===");
++    Log("PROCESS: %ls", exe.c_str());
++
++    int rc = 64;
++    if (argc == 5 && std::wstring_view(argv[1]) == L"--bridge-probe") {
++        const std::wstring session = argv[2];
++        const uint32_t width =
++            static_cast<uint32_t>(_wcstoui64(argv[3], nullptr, 10));
++        const uint32_t height =
++            static_cast<uint32_t>(_wcstoui64(argv[4], nullptr, 10));
++        rc = RunBridge(session, width, height);
++    } else {
++        Log("USAGE: nvngx.dll --bridge-probe <session> <width> <height>");
++    }
++
++    Log("EXIT: %d", rc);
++    if (g_log) {
++        fclose(g_log);
++        g_log = nullptr;
++    }
++    return rc;
++}
+
+diff --git a/tools/DLSSNR.WorkerBridge/bridge_client.cpp b/tools/DLSSNR.WorkerBridge/bridge_client.cpp
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.WorkerBridge/bridge_client.cpp
+@@ -0,0 +1,433 @@
++// D3D11 side of the Magpie DLSSNR cross-process bridge probe.
++// It creates the same NT-shared texture/fence primitives used by Magpie,
++// launches nvngx.dll, waits for one DLSSNR evaluation, and reads the output.
++
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <Windows.h>
++#include <d3d11_4.h>
++#include <dxgi1_6.h>
++#include <wrl/client.h>
++
++#include "bridge_protocol.h"
++
++#include <cstdint>
++#include <cstdarg>
++#include <cstdio>
++#include <filesystem>
++#include <string>
++#include <vector>
++
++using Microsoft::WRL::ComPtr;
++using namespace MagpieDlssnrBridge;
++
++namespace {
++
++void Log(const char* fmt, ...) {
++    va_list args;
++    va_start(args, fmt);
++    vprintf(fmt, args);
++    fputc('\n', stdout);
++    fflush(stdout);
++    va_end(args);
++}
++
++std::filesystem::path ExePath() {
++    std::wstring buf(32768, L'\0');
++    DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
++    if (!n || n >= buf.size()) return {};
++    buf.resize(n);
++    return std::filesystem::path(buf);
++}
++
++ComPtr<IDXGIAdapter1> PickNvidiaAdapter() {
++    ComPtr<IDXGIFactory6> factory;
++    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) return {};
++
++    for (UINT i = 0;; ++i) {
++        ComPtr<IDXGIAdapter1> adapter;
++        HRESULT hr = factory->EnumAdapterByGpuPreference(
++            i, DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
++            IID_PPV_ARGS(&adapter));
++        if (hr == DXGI_ERROR_NOT_FOUND) break;
++        if (FAILED(hr)) continue;
++
++        DXGI_ADAPTER_DESC1 desc{};
++        if (FAILED(adapter->GetDesc1(&desc))) continue;
++        if (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) continue;
++        if (desc.VendorId != 0x10DE) continue;
++
++        char name[256]{};
++        WideCharToMultiByte(
++            CP_UTF8, 0, desc.Description, -1,
++            name, static_cast<int>(sizeof(name)), nullptr, nullptr);
++        Log("DXGI: selected %s", name);
++        return adapter;
++    }
++    return {};
++}
++
++bool CreateNamedSharedTexture(
++    ID3D11Device5* device,
++    uint32_t width,
++    uint32_t height,
++    const std::wstring& name,
++    ComPtr<ID3D11Texture2D>& texture) {
++    D3D11_TEXTURE2D_DESC desc{};
++    desc.Width = width;
++    desc.Height = height;
++    desc.MipLevels = 1;
++    desc.ArraySize = 1;
++    desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    desc.SampleDesc.Count = 1;
++    desc.Usage = D3D11_USAGE_DEFAULT;
++    desc.BindFlags =
++        D3D11_BIND_SHADER_RESOURCE |
++        D3D11_BIND_UNORDERED_ACCESS;
++    desc.CPUAccessFlags = 0;
++    desc.MiscFlags =
++        D3D11_RESOURCE_MISC_SHARED |
++        D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
++
++    HRESULT hr = device->CreateTexture2D(
++        &desc, nullptr, &texture);
++    if (FAILED(hr)) {
++        Log("D3D11: CreateTexture2D(%ls) failed hr=0x%08x",
++            name.c_str(), static_cast<unsigned>(hr));
++        return false;
++    }
++
++    ComPtr<IDXGIResource1> dxgi;
++    hr = texture.As(&dxgi);
++    if (FAILED(hr)) return false;
++
++    HANDLE h = nullptr;
++    hr = dxgi->CreateSharedHandle(
++        nullptr, GENERIC_ALL, name.c_str(), &h);
++    if (FAILED(hr)) {
++        Log("D3D11: CreateSharedHandle(%ls) failed hr=0x%08x",
++            name.c_str(), static_cast<unsigned>(hr));
++        return false;
++    }
++    CloseHandle(h);
++    Log("D3D11: created %ls", name.c_str());
++    return true;
++}
++
++bool CreateNamedSharedFence(
++    ID3D11Device5* device,
++    const std::wstring& name,
++    ComPtr<ID3D11Fence>& fence) {
++    HRESULT hr = device->CreateFence(
++        0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence));
++    if (FAILED(hr)) {
++        Log("D3D11: CreateFence failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return false;
++    }
++
++    HANDLE h = nullptr;
++    hr = fence->CreateSharedHandle(
++        nullptr, GENERIC_ALL, name.c_str(), &h);
++    if (FAILED(hr)) {
++        Log("D3D11: fence CreateSharedHandle failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return false;
++    }
++    CloseHandle(h);
++    Log("D3D11: created %ls", name.c_str());
++    return true;
++}
++
++bool FillInput(
++    ID3D11DeviceContext4* context,
++    ID3D11Texture2D* input,
++    uint32_t width,
++    uint32_t height) {
++    std::vector<uint32_t> pixels(size_t(width) * size_t(height));
++    for (uint32_t y = 0; y < height; ++y) {
++        for (uint32_t x = 0; x < width; ++x) {
++            const uint8_t r = static_cast<uint8_t>((x * 255u) / (width - 1));
++            const uint8_t g = static_cast<uint8_t>((y * 255u) / (height - 1));
++            const uint8_t b = static_cast<uint8_t>(
++                ((x / 32 + y / 32) & 1) ? 220 : 30);
++            const uint8_t a = 255;
++            pixels[size_t(y) * width + x] =
++                uint32_t(r) |
++                (uint32_t(g) << 8) |
++                (uint32_t(b) << 16) |
++                (uint32_t(a) << 24);
++        }
++    }
++
++    context->UpdateSubresource(
++        input, 0, nullptr, pixels.data(),
++        width * sizeof(uint32_t), 0);
++    return true;
++}
++
++bool ReadOutput(
++    ID3D11Device5* device,
++    ID3D11DeviceContext4* context,
++    ID3D11Texture2D* output,
++    uint32_t width,
++    uint32_t height) {
++    D3D11_TEXTURE2D_DESC desc{};
++    output->GetDesc(&desc);
++    desc.BindFlags = 0;
++    desc.MiscFlags = 0;
++    desc.Usage = D3D11_USAGE_STAGING;
++    desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++
++    ComPtr<ID3D11Texture2D> staging;
++    HRESULT hr = device->CreateTexture2D(
++        &desc, nullptr, &staging);
++    if (FAILED(hr)) {
++        Log("READBACK: staging CreateTexture2D failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return false;
++    }
++
++    context->CopyResource(staging.Get(), output);
++    context->Flush();
++
++    D3D11_MAPPED_SUBRESOURCE mapped{};
++    hr = context->Map(
++        staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
++    if (FAILED(hr)) {
++        Log("READBACK: Map failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return false;
++    }
++
++    uint64_t hash = 1469598103934665603ull;
++    uint64_t nonZero = 0;
++    uint64_t samples = 0;
++
++    for (uint32_t y = 0; y < height; ++y) {
++        const auto* row = reinterpret_cast<const uint8_t*>(
++            mapped.pData) + size_t(y) * mapped.RowPitch;
++        for (uint32_t x = 0; x < width * 4u; x += 4u) {
++            const uint32_t pixel =
++                uint32_t(row[x + 0]) |
++                (uint32_t(row[x + 1]) << 8) |
++                (uint32_t(row[x + 2]) << 16) |
++                (uint32_t(row[x + 3]) << 24);
++            hash ^= pixel;
++            hash *= 1099511628211ull;
++            if (pixel != 0) ++nonZero;
++            ++samples;
++        }
++    }
++
++    context->Unmap(staging.Get(), 0);
++
++    Log("READBACK: pixels=%llu nonzero=%llu hash=0x%016llx",
++        static_cast<unsigned long long>(samples),
++        static_cast<unsigned long long>(nonZero),
++        static_cast<unsigned long long>(hash));
++
++    return nonZero > 0;
++}
++
++bool SpawnWorker(
++    const std::filesystem::path& worker,
++    const std::wstring& session,
++    uint32_t width,
++    uint32_t height,
++    PROCESS_INFORMATION& pi) {
++    std::wstring command = L"\"" + worker.wstring() +
++        L"\" --bridge-probe \"" + session + L"\" " +
++        std::to_wstring(width) + L" " + std::to_wstring(height);
++
++    STARTUPINFOW si{};
++    si.cb = sizeof(si);
++
++    std::vector<wchar_t> mutableCommand(
++        command.begin(), command.end());
++    mutableCommand.push_back(L'\0');
++
++    const BOOL ok = CreateProcessW(
++        worker.c_str(),
++        mutableCommand.data(),
++        nullptr, nullptr, FALSE,
++        CREATE_NO_WINDOW,
++        nullptr,
++        worker.parent_path().c_str(),
++        &si, &pi);
++
++    if (!ok) {
++        Log("PROCESS: CreateProcess(%ls) failed win32=%lu",
++            worker.c_str(), GetLastError());
++        return false;
++    }
++
++    Log("PROCESS: worker pid=%lu", pi.dwProcessId);
++    return true;
++}
++
++} // namespace
++
++int wmain() {
++    constexpr uint32_t kWidth = 1280;
++    constexpr uint32_t kHeight = 720;
++
++    const auto exe = ExePath();
++    if (exe.empty()) {
++        Log("FATAL: cannot resolve client path");
++        return 2;
++    }
++
++    const auto dir = exe.parent_path();
++    const auto worker = dir / L"nvngx.dll";
++    const auto runtime = dir / L"nvngx_dlssnr.dll";
++    if (!std::filesystem::exists(worker)) {
++        Log("FATAL: missing %ls", worker.c_str());
++        return 3;
++    }
++    if (!std::filesystem::exists(runtime)) {
++        Log("FATAL: missing %ls", runtime.c_str());
++        return 4;
++    }
++
++    const std::wstring session =
++        std::to_wstring(GetCurrentProcessId());
++
++    auto adapter = PickNvidiaAdapter();
++    if (!adapter) {
++        Log("FATAL: NVIDIA adapter not found");
++        return 5;
++    }
++
++    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
++    D3D_FEATURE_LEVEL levels[]{
++        D3D_FEATURE_LEVEL_12_1,
++        D3D_FEATURE_LEVEL_12_0,
++        D3D_FEATURE_LEVEL_11_1,
++        D3D_FEATURE_LEVEL_11_0
++    };
++
++    ComPtr<ID3D11Device> baseDevice;
++    ComPtr<ID3D11DeviceContext> baseContext;
++    D3D_FEATURE_LEVEL actual{};
++    HRESULT hr = D3D11CreateDevice(
++        adapter.Get(),
++        D3D_DRIVER_TYPE_UNKNOWN,
++        nullptr,
++        flags,
++        levels,
++        ARRAYSIZE(levels),
++        D3D11_SDK_VERSION,
++        &baseDevice,
++        &actual,
++        &baseContext);
++    if (FAILED(hr)) {
++        Log("FATAL: D3D11CreateDevice failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 6;
++    }
++
++    ComPtr<ID3D11Device5> device;
++    ComPtr<ID3D11DeviceContext4> context;
++    if (FAILED(baseDevice.As(&device)) ||
++        FAILED(baseContext.As(&context))) {
++        Log("FATAL: D3D11.4 interfaces unavailable");
++        return 7;
++    }
++
++    Log("D3D11: device created featureLevel=0x%x",
++        static_cast<unsigned>(actual));
++
++    ComPtr<ID3D11Texture2D> input;
++    ComPtr<ID3D11Texture2D> output;
++    ComPtr<ID3D11Fence> fence;
++
++    if (!CreateNamedSharedTexture(
++            device.Get(), kWidth, kHeight,
++            InputName(session), input) ||
++        !CreateNamedSharedTexture(
++            device.Get(), kWidth, kHeight,
++            OutputName(session), output) ||
++        !CreateNamedSharedFence(
++            device.Get(), FenceName(session), fence)) {
++        return 8;
++    }
++
++    FillInput(context.Get(), input.Get(), kWidth, kHeight);
++
++    // Ensure input writes are queued before advertising fence value 1.
++    hr = context->Signal(
++        fence.Get(), kInputReadyFenceValue);
++    if (FAILED(hr)) {
++        Log("FENCE: input signal failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 9;
++    }
++    context->Flush();
++    Log("FENCE: input signaled value=%llu",
++        static_cast<unsigned long long>(kInputReadyFenceValue));
++
++    PROCESS_INFORMATION pi{};
++    if (!SpawnWorker(worker, session, kWidth, kHeight, pi)) {
++        return 10;
++    }
++
++    HANDLE eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    if (!eventHandle) {
++        TerminateProcess(pi.hProcess, 99);
++        CloseHandle(pi.hThread);
++        CloseHandle(pi.hProcess);
++        return 11;
++    }
++
++    hr = fence->SetEventOnCompletion(
++        kOutputReadyFenceValue, eventHandle);
++    if (FAILED(hr)) {
++        Log("FENCE: SetEventOnCompletion failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        TerminateProcess(pi.hProcess, 99);
++        CloseHandle(eventHandle);
++        CloseHandle(pi.hThread);
++        CloseHandle(pi.hProcess);
++        return 12;
++    }
++
++    const DWORD wait = WaitForSingleObject(eventHandle, 30000);
++    CloseHandle(eventHandle);
++
++    if (wait != WAIT_OBJECT_0) {
++        Log("FENCE: output timeout; worker log should explain the failure");
++        WaitForSingleObject(pi.hProcess, 1000);
++        DWORD exitCode = STILL_ACTIVE;
++        GetExitCodeProcess(pi.hProcess, &exitCode);
++        Log("PROCESS: worker exit code=%lu", exitCode);
++        if (exitCode == STILL_ACTIVE) {
++            TerminateProcess(pi.hProcess, 98);
++        }
++        CloseHandle(pi.hThread);
++        CloseHandle(pi.hProcess);
++        return 13;
++    }
++
++    Log("FENCE: output ready value=%llu",
++        static_cast<unsigned long long>(kOutputReadyFenceValue));
++
++    const bool outputValid = ReadOutput(
++        device.Get(), context.Get(), output.Get(), kWidth, kHeight);
++
++    WaitForSingleObject(pi.hProcess, 10000);
++    DWORD exitCode = 0;
++    GetExitCodeProcess(pi.hProcess, &exitCode);
++    CloseHandle(pi.hThread);
++    CloseHandle(pi.hProcess);
++
++    Log("PROCESS: worker exit code=%lu", exitCode);
++
++    if (outputValid && exitCode == 0) {
++        Log("SUCCESS: D3D11 -> nvngx.dll/D3D12 -> D3D11 bridge works");
++        return 0;
++    }
++
++    Log("FAIL: bridge did not produce a valid frame");
++    return 20;
++}
+
+diff --git a/tools/DLSSNR.WorkerBridge/DLSSNR.WorkerBridge.vcxproj b/tools/DLSSNR.WorkerBridge/DLSSNR.WorkerBridge.vcxproj
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.WorkerBridge/DLSSNR.WorkerBridge.vcxproj
+@@ -0,0 +1,61 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
++  <ItemGroup Label="ProjectConfigurations">
++    <ProjectConfiguration Include="Release|x64">
++      <Configuration>Release</Configuration>
++      <Platform>x64</Platform>
++    </ProjectConfiguration>
++  </ItemGroup>
++
++  <PropertyGroup Label="Globals">
++    <ProjectGuid>{926E7EA5-993D-407F-9FC0-08BB25015B73}</ProjectGuid>
++    <Keyword>Win32Proj</Keyword>
++    <RootNamespace>MagpieDLSSNRWorkerBridge</RootNamespace>
++    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
++  </PropertyGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
++
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
++    <ConfigurationType>Application</ConfigurationType>
++    <UseDebugLibraries>false</UseDebugLibraries>
++    <PlatformToolset>v145</PlatformToolset>
++    <WholeProgramOptimization>true</WholeProgramOptimization>
++    <CharacterSet>Unicode</CharacterSet>
++  </PropertyGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
++
++  <PropertyGroup>
++    <DLSSSdkDir Condition="'$(DLSSSdkDir)'==''">$(MSBuildThisFileDirectory)..\..\dependencies\dlss-sdk</DLSSSdkDir>
++    <OutDir Condition="'$(BridgeOutDir)'!=''">$(BridgeOutDir)</OutDir>
++    <OutDir Condition="'$(BridgeOutDir)'==''">$(MSBuildThisFileDirectory)bin\</OutDir>
++    <IntDir>$(MSBuildThisFileDirectory)obj\worker\</IntDir>
++    <TargetName>nvngx</TargetName>
++    <TargetExt>.dll</TargetExt>
++  </PropertyGroup>
++
++  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
++    <ClCompile>
++      <WarningLevel>Level4</WarningLevel>
++      <TreatWarningAsError>false</TreatWarningAsError>
++      <Optimization>MaxSpeed</Optimization>
++      <LanguageStandard>stdcpp20</LanguageStandard>
++      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++      <AdditionalIncludeDirectories>$(DLSSSdkDir)\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
++    </ClCompile>
++    <Link>
++      <SubSystem>Console</SubSystem>
++      <OptimizeReferences>true</OptimizeReferences>
++      <EnableCOMDATFolding>true</EnableCOMDATFolding>
++      <AdditionalDependencies>$(DLSSSdkDir)\lib\Windows_x86_64\x64\nvsdk_ngx_d.lib;d3d12.lib;dxgi.lib;dxguid.lib;user32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
++    </Link>
++  </ItemDefinitionGroup>
++
++  <ItemGroup>
++    <ClCompile Include="nvngx_worker_bridge.cpp" />
++    <ClInclude Include="bridge_protocol.h" />
++  </ItemGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
++</Project>
+
+diff --git a/tools/DLSSNR.WorkerBridge/DLSSNR.BridgeClient.vcxproj b/tools/DLSSNR.WorkerBridge/DLSSNR.BridgeClient.vcxproj
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.WorkerBridge/DLSSNR.BridgeClient.vcxproj
+@@ -0,0 +1,59 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
++  <ItemGroup Label="ProjectConfigurations">
++    <ProjectConfiguration Include="Release|x64">
++      <Configuration>Release</Configuration>
++      <Platform>x64</Platform>
++    </ProjectConfiguration>
++  </ItemGroup>
++
++  <PropertyGroup Label="Globals">
++    <ProjectGuid>{44D62D6A-84CD-4A67-98B1-2EE164A9C079}</ProjectGuid>
++    <Keyword>Win32Proj</Keyword>
++    <RootNamespace>MagpieDLSSNRBridgeClient</RootNamespace>
++    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
++  </PropertyGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
++
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
++    <ConfigurationType>Application</ConfigurationType>
++    <UseDebugLibraries>false</UseDebugLibraries>
++    <PlatformToolset>v145</PlatformToolset>
++    <WholeProgramOptimization>true</WholeProgramOptimization>
++    <CharacterSet>Unicode</CharacterSet>
++  </PropertyGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
++
++  <PropertyGroup>
++    <OutDir Condition="'$(BridgeOutDir)'!=''">$(BridgeOutDir)</OutDir>
++    <OutDir Condition="'$(BridgeOutDir)'==''">$(MSBuildThisFileDirectory)bin\</OutDir>
++    <IntDir>$(MSBuildThisFileDirectory)obj\client\</IntDir>
++    <TargetName>magpie-dlssnr-bridge-client</TargetName>
++    <TargetExt>.exe</TargetExt>
++  </PropertyGroup>
++
++  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
++    <ClCompile>
++      <WarningLevel>Level4</WarningLevel>
++      <TreatWarningAsError>false</TreatWarningAsError>
++      <Optimization>MaxSpeed</Optimization>
++      <LanguageStandard>stdcpp20</LanguageStandard>
++      <PreprocessorDefinitions>WIN32;_WINDOWS;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
++    </ClCompile>
++    <Link>
++      <SubSystem>Console</SubSystem>
++      <OptimizeReferences>true</OptimizeReferences>
++      <EnableCOMDATFolding>true</EnableCOMDATFolding>
++      <AdditionalDependencies>d3d11.lib;dxgi.lib;dxguid.lib;user32.lib;advapi32.lib;%(AdditionalDependencies)</AdditionalDependencies>
++    </Link>
++  </ItemDefinitionGroup>
++
++  <ItemGroup>
++    <ClCompile Include="bridge_client.cpp" />
++    <ClInclude Include="bridge_protocol.h" />
++  </ItemGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
++</Project>
+
+diff --git a/tools/DLSSNR.WorkerBridge/run-bridge-probe.ps1 b/tools/DLSSNR.WorkerBridge/run-bridge-probe.ps1
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.WorkerBridge/run-bridge-probe.ps1
+@@ -0,0 +1,22 @@
++$ErrorActionPreference = "Stop"
++Set-Location $PSScriptRoot
++
++if (!(Test-Path ".\nvngx.dll")) {
++    throw "nvngx.dll is missing"
++}
++if (!(Test-Path ".\nvngx_dlssnr.dll")) {
++    throw "Copy the same nvngx_dlssnr.dll that worked in NeuralScreen into this folder."
++}
++if (!(Test-Path ".\magpie-dlssnr-bridge-client.exe")) {
++    throw "magpie-dlssnr-bridge-client.exe is missing"
++}
++
++Remove-Item ".\magpie-dlssnr-worker-bridge.log" -ErrorAction SilentlyContinue
++
++& ".\magpie-dlssnr-bridge-client.exe"
++$rc = $LASTEXITCODE
++
++Write-Host ""
++Write-Host "client exit code:" $rc
++Write-Host "worker log:" (Join-Path $PSScriptRoot "magpie-dlssnr-worker-bridge.log")
++exit $rc
+
+diff --git a/.github/workflows/dlssnr-worker-bridge.yml b/.github/workflows/dlssnr-worker-bridge.yml
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/.github/workflows/dlssnr-worker-bridge.yml
+@@ -0,0 +1,88 @@
++name: DLSSNR worker bridge probe
++
++on:
++  workflow_dispatch:
++  push:
++    paths:
++      - '.github/workflows/dlssnr-worker-bridge.yml'
++      - 'tools/DLSSNR.WorkerBridge/**'
++
++jobs:
++  bridge-probe:
++    runs-on: windows-2025-vs2026
++
++    steps:
++      - name: Checkout Magpie
++        uses: actions/checkout@v7
++
++      - name: Checkout NVIDIA DLSS SDK
++        uses: actions/checkout@v7
++        with:
++          repository: NVIDIA/DLSS
++          path: dependencies/dlss-sdk
++          lfs: true
++
++      - name: Setup MSBuild
++        uses: microsoft/setup-msbuild@v2
++
++      - name: Build worker and D3D11 bridge client
++        shell: pwsh
++        run: |
++          $sdk = Join-Path $env:GITHUB_WORKSPACE "dependencies\dlss-sdk"
++          $out = Join-Path $env:GITHUB_WORKSPACE "worker-bridge"
++
++          New-Item -ItemType Directory -Force -Path $out | Out-Null
++
++          msbuild `
++            "$env:GITHUB_WORKSPACE\tools\DLSSNR.WorkerBridge\DLSSNR.WorkerBridge.vcxproj" `
++            /m /t:Rebuild `
++            /p:Configuration=Release `
++            /p:Platform=x64 `
++            /p:DLSSSdkDir="$sdk" `
++            /p:BridgeOutDir="$out\" `
++            /v:minimal
++
++          msbuild `
++            "$env:GITHUB_WORKSPACE\tools\DLSSNR.WorkerBridge\DLSSNR.BridgeClient.vcxproj" `
++            /m /t:Rebuild `
++            /p:Configuration=Release `
++            /p:Platform=x64 `
++            /p:BridgeOutDir="$out\" `
++            /v:minimal
++
++          if (!(Test-Path (Join-Path $out "nvngx.dll"))) {
++            throw "nvngx.dll was not built"
++          }
++          if (!(Test-Path (Join-Path $out "magpie-dlssnr-bridge-client.exe"))) {
++            throw "bridge client was not built"
++          }
++
++          Copy-Item `
++            "$env:GITHUB_WORKSPACE\tools\DLSSNR.WorkerBridge\run-bridge-probe.ps1" `
++            (Join-Path $out "run-bridge-probe.ps1")
++
++          @"
++          Magpie DLSSNR cross-process bridge probe
++
++          1. Copy the SAME nvngx_dlssnr.dll that worked in NeuralScreen
++             into this folder.
++          2. Run:
++               powershell -ExecutionPolicy Bypass -File .\run-bridge-probe.ps1
++          3. Send BOTH console output and magpie-dlssnr-worker-bridge.log.
++
++          What this tests:
++          D3D11 shared input/output texture
++              -> named NT handles
++              -> nvngx.dll D3D12 worker
++              -> Feature 18 Evaluate
++              -> shared D3D11 fence
++              -> D3D11 readback
++
++          It does not modify Magpie yet.
++          "@ | Set-Content -Encoding UTF8 (Join-Path $out "README.txt")
++
++      - name: Upload bridge probe
++        uses: actions/upload-artifact@v7
++        with:
++          name: Magpie-DLSSNR-worker-bridge-x64
++          path: worker-bridge

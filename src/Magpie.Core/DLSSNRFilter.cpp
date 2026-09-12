@@ -10,6 +10,7 @@
 #include "FrameGuidancePerformance.h"
 #include "NativeBackendTiming.h"
 #include "OpticalFlowSettings.h"
+#include "DLSSNRWorkerProtocol.h"
 
 namespace Magpie {
 
@@ -58,6 +59,7 @@ DLSSNRSettings ParseDLSSNRSettings(const EffectOption& option, bool hdrEnabled) 
 #include <d3d12.h>
 #include <nvsdk_ngx.h>
 #include <atomic>
+#include <vector>
 
 namespace Magpie {
 
@@ -88,6 +90,10 @@ constexpr unsigned long long DLSSNR_SIGNED_SNIPPET_APPLICATION_ID = 0x0876232Cul
 // Keep the unsupported Core Feature 18 route as an explicit diagnostic only.
 // It must never run before the signed snippet in a production session.
 constexpr bool ENABLE_CORE_FEATURE18_DIAGNOSTIC = false;
+// RTX 20/30/40 compatibility path. Feature 18 is hosted in a dedicated
+// executable PE named nvngx.dll; the original in-process implementation remains
+// below as a diagnostic fallback and is not entered when this is true.
+constexpr bool USE_EXTERNAL_DLSSNR_WORKER = true;
 
 constexpr char PARAM_WIDTH[] = "DLSSNR.Width";
 constexpr char PARAM_HEIGHT[] = "DLSSNR.Height";
@@ -596,6 +602,22 @@ struct DLSSNRFilter::Impl {
 
 	ID3D11Device5* device11 = nullptr;
 	ID3D11DeviceContext4* context11 = nullptr;
+
+	// External DLSSNR worker state. The process handle stays alive for the whole
+	// filter session; named NT handles must also remain open so the worker can
+	// reopen the D3D11 resources from its own D3D12 device.
+	bool workerMode = false;
+	std::wstring workerSession;
+	wil::unique_handle workerInputSharedHandle;
+	wil::unique_handle workerOutputSharedHandle;
+	wil::unique_handle workerFenceSharedHandle;
+	wil::unique_handle workerControlMapping;
+	wil::unique_handle workerReadyEvent;
+	wil::unique_handle workerStopEvent;
+	wil::unique_handle workerProcess;
+	wil::unique_handle workerThread;
+	DLSSNRWorkerProtocol::ControlBlock* workerControl = nullptr;
+
 	NgxD3D12Core* coreOwner = nullptr;
 	winrt::com_ptr<ID3D12Device> device12;
 	winrt::com_ptr<ID3D12CommandQueue> queue12;
@@ -944,6 +966,343 @@ bool RestoreSnippetCallerCompatibility(DLSSNRFilter::Impl& impl) noexcept {
 
 }
 
+
+static std::wstring CreateWorkerSessionId(const DLSSNRFilter::Impl& impl) {
+	return std::to_wstring(GetCurrentProcessId()) + L"_" +
+		std::to_wstring(reinterpret_cast<uintptr_t>(&impl));
+}
+
+static bool CreateWorkerSharedTexture(
+	DLSSNRFilter::Impl& impl,
+	const D3D11_TEXTURE2D_DESC& sourceDesc,
+	bool allowUav,
+	std::wstring_view objectName,
+	winrt::com_ptr<ID3D11Texture2D>& texture11,
+	wil::unique_handle& sharedHandle
+) noexcept {
+	D3D11_TEXTURE2D_DESC desc = sourceDesc;
+	desc.Usage = D3D11_USAGE_DEFAULT;
+	desc.CPUAccessFlags = 0;
+	desc.BindFlags = D3D11_BIND_SHADER_RESOURCE |
+		(allowUav ? D3D11_BIND_UNORDERED_ACCESS : 0);
+	desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED |
+		D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+	HRESULT hr = impl.device11->CreateTexture2D(
+		&desc, nullptr, texture11.put());
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR worker shared D3D11 texture failed", hr);
+		return false;
+	}
+
+	winrt::com_ptr<IDXGIResource1> dxgiResource;
+	hr = texture11->QueryInterface(
+		IID_PPV_ARGS(dxgiResource.put()));
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Query DLSSNR worker shared IDXGIResource1 failed", hr);
+		return false;
+	}
+
+	HANDLE rawHandle = nullptr;
+	const std::wstring name(objectName);
+	hr = dxgiResource->CreateSharedHandle(
+		nullptr, GENERIC_ALL, name.c_str(), &rawHandle);
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create named DLSSNR worker texture handle failed", hr);
+		return false;
+	}
+	sharedHandle.reset(rawHandle);
+	return true;
+}
+
+static void PublishWorkerSettings(
+	DLSSNRFilter::Impl& impl,
+	const DLSSNRSettings& settings,
+	bool resetHistory
+) noexcept {
+	auto* control = impl.workerControl;
+	if (!control) return;
+
+	control->style = settings.style;
+	control->intensity = settings.intensity;
+	control->localToneStrength = settings.localToneStrength;
+	control->localStructureStrength = settings.localStructureStrength;
+	control->skinStructureStrength = settings.skinStructureStrength;
+	control->useAutoMask = settings.useAutoMask ? 1u : 0u;
+	control->uiCorrection = settings.uiCorrection ? 1u : 0u;
+	if (resetHistory) {
+		InterlockedExchange(&control->resetHistory, 1);
+	}
+	MemoryBarrier();
+	InterlockedIncrement(&control->settingsRevision);
+}
+
+static bool WaitForWorkerFence(
+	DLSSNRFilter::Impl& impl,
+	uint64_t value,
+	DWORD timeoutMs = 10000
+) noexcept {
+	if (!value || !impl.fence11 ||
+		impl.fence11->GetCompletedValue() >= value) {
+		return true;
+	}
+	if (!impl.fenceEvent) {
+		Logger::Get().Error("DLSSNR worker fence event is unavailable");
+		return false;
+	}
+
+	ResetEvent(impl.fenceEvent.get());
+	const HRESULT hr = impl.fence11->SetEventOnCompletion(
+		value, impl.fenceEvent.get());
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Set DLSSNR worker fence event failed", hr);
+		return false;
+	}
+
+	const DWORD wait = WaitForSingleObject(
+		impl.fenceEvent.get(), timeoutMs);
+	if (wait != WAIT_OBJECT_0) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR worker fence wait timed out: value={} wait={:#x}",
+			value, wait));
+		return false;
+	}
+	return true;
+}
+
+static void StopExternalWorker(DLSSNRFilter::Impl& impl) noexcept {
+	if (!impl.workerMode) return;
+
+	if (impl.fenceValue) {
+		WaitForWorkerFence(impl, impl.fenceValue, 3000);
+	}
+	if (impl.workerStopEvent) {
+		SetEvent(impl.workerStopEvent.get());
+	}
+
+	if (impl.workerProcess) {
+		const DWORD wait = WaitForSingleObject(
+			impl.workerProcess.get(), 3000);
+		if (wait == WAIT_TIMEOUT) {
+			Logger::Get().Warn(
+				"DLSSNR worker did not exit in time; terminating process");
+			TerminateProcess(impl.workerProcess.get(), 0xD155);
+			WaitForSingleObject(impl.workerProcess.get(), 1000);
+		}
+	}
+
+	if (impl.workerControl) {
+		UnmapViewOfFile(impl.workerControl);
+		impl.workerControl = nullptr;
+	}
+
+	impl.workerThread.reset();
+	impl.workerProcess.reset();
+	impl.workerReadyEvent.reset();
+	impl.workerStopEvent.reset();
+	impl.workerControlMapping.reset();
+	impl.workerFenceSharedHandle.reset();
+	impl.workerOutputSharedHandle.reset();
+	impl.workerInputSharedHandle.reset();
+	impl.workerMode = false;
+}
+
+static bool StartExternalWorker(
+	DLSSNRFilter::Impl& impl,
+	const D3D11_TEXTURE2D_DESC& sharedDesc,
+	const DLSSNRSettings& settings
+) noexcept {
+	using namespace DLSSNRWorkerProtocol;
+
+	const std::filesystem::path applicationDirectory =
+		Win32Helper::GetExePath().parent_path();
+	const std::filesystem::path workerPath =
+		applicationDirectory / L"nvngx.dll";
+	const std::filesystem::path runtimePath =
+		applicationDirectory / L"nvngx_dlssnr.dll";
+	if (!std::filesystem::exists(workerPath)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR worker is missing: {}",
+			workerPath.string()));
+		return false;
+	}
+	if (!std::filesystem::exists(runtimePath)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR signed runtime is missing: {}",
+			runtimePath.string()));
+		return false;
+	}
+
+	impl.workerSession = CreateWorkerSessionId(impl);
+	// Mark ownership immediately so every early-return path tears down mappings,
+	// named handles and a partially-started child process through Impl::~Impl.
+	impl.workerMode = true;
+
+	if (!CreateWorkerSharedTexture(
+		impl, sharedDesc, true,
+		InputName(impl.workerSession),
+		impl.sharedInput11,
+		impl.workerInputSharedHandle) ||
+		!CreateWorkerSharedTexture(
+			impl, sharedDesc, true,
+			OutputName(impl.workerSession),
+			impl.sharedOutput11,
+			impl.workerOutputSharedHandle)) {
+		return false;
+	}
+
+	HRESULT hr = impl.device11->CreateFence(
+		0, D3D11_FENCE_FLAG_SHARED,
+		IID_PPV_ARGS(impl.fence11.put()));
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create DLSSNR worker shared fence failed", hr);
+		return false;
+	}
+
+	HANDLE rawFence = nullptr;
+	const std::wstring fenceName =
+		FenceName(impl.workerSession);
+	hr = impl.fence11->CreateSharedHandle(
+		nullptr, GENERIC_ALL,
+		fenceName.c_str(), &rawFence);
+	if (FAILED(hr)) {
+		Logger::Get().ComError(
+			"Create named DLSSNR worker fence handle failed", hr);
+		return false;
+	}
+	impl.workerFenceSharedHandle.reset(rawFence);
+
+	const std::wstring controlName =
+		ControlName(impl.workerSession);
+	HANDLE mapping = CreateFileMappingW(
+		INVALID_HANDLE_VALUE, nullptr,
+		PAGE_READWRITE, 0,
+		sizeof(ControlBlock),
+		controlName.c_str());
+	if (!mapping) {
+		Logger::Get().Win32Error(
+			"Create DLSSNR worker control mapping failed");
+		return false;
+	}
+	impl.workerControlMapping.reset(mapping);
+	impl.workerControl =
+		static_cast<ControlBlock*>(
+			MapViewOfFile(
+				mapping, FILE_MAP_ALL_ACCESS,
+				0, 0, sizeof(ControlBlock)));
+	if (!impl.workerControl) {
+		Logger::Get().Win32Error(
+			"Map DLSSNR worker control block failed");
+		return false;
+	}
+	std::memset(impl.workerControl, 0, sizeof(ControlBlock));
+	impl.workerControl->magic = MAGIC;
+	impl.workerControl->version = VERSION;
+	impl.workerControl->width = impl.width;
+	impl.workerControl->height = impl.height;
+	impl.workerControl->colorFormat =
+		static_cast<uint32_t>(sharedDesc.Format);
+	impl.workerControl->workerState =
+		static_cast<LONG>(WorkerState::Starting);
+	impl.workerControl->resetHistory = 1;
+	PublishWorkerSettings(impl, settings, true);
+
+	HANDLE ready = CreateEventW(
+		nullptr, TRUE, FALSE,
+		ReadyName(impl.workerSession).c_str());
+	if (!ready) {
+		Logger::Get().Win32Error(
+			"Create DLSSNR worker ready event failed");
+		return false;
+	}
+	impl.workerReadyEvent.reset(ready);
+
+	HANDLE stop = CreateEventW(
+		nullptr, TRUE, FALSE,
+		StopName(impl.workerSession).c_str());
+	if (!stop) {
+		Logger::Get().Win32Error(
+			"Create DLSSNR worker stop event failed");
+		return false;
+	}
+	impl.workerStopEvent.reset(stop);
+
+	if (FAILED(impl.fenceEvent.create())) {
+		Logger::Get().Error(
+			"Create DLSSNR worker fence event failed");
+		return false;
+	}
+
+	std::wstring commandLine =
+		L"\"" + workerPath.wstring() +
+		L"\" --magpie-session \"" +
+		impl.workerSession + L"\"";
+	std::vector<wchar_t> mutableCommand(
+		commandLine.begin(), commandLine.end());
+	mutableCommand.push_back(L'\0');
+
+	STARTUPINFOW startup{};
+	startup.cb = sizeof(startup);
+	PROCESS_INFORMATION process{};
+	if (!CreateProcessW(
+		workerPath.c_str(),
+		mutableCommand.data(),
+		nullptr, nullptr, FALSE,
+		CREATE_NO_WINDOW,
+		nullptr,
+		applicationDirectory.c_str(),
+		&startup, &process)) {
+		Logger::Get().Win32Error(
+			"Launch DLSSNR worker failed");
+		return false;
+	}
+	impl.workerProcess.reset(process.hProcess);
+	impl.workerThread.reset(process.hThread);
+
+	HANDLE waits[]{
+		impl.workerReadyEvent.get(),
+		impl.workerProcess.get()
+	};
+	const DWORD wait = WaitForMultipleObjects(
+		ARRAYSIZE(waits), waits, FALSE, 15000);
+	if (wait != WAIT_OBJECT_0) {
+		DWORD exitCode = STILL_ACTIVE;
+		GetExitCodeProcess(
+			impl.workerProcess.get(), &exitCode);
+		Logger::Get().Error(fmt::format(
+			"DLSSNR worker initialization failed: wait={:#x} exitCode={:#x}",
+			wait, exitCode));
+		StopExternalWorker(impl);
+		return false;
+	}
+
+	const LONG state = InterlockedCompareExchange(
+		&impl.workerControl->workerState, 0, 0);
+	const LONG result = InterlockedCompareExchange(
+		&impl.workerControl->lastResult, 0, 0);
+	if (state != static_cast<LONG>(WorkerState::Ready) ||
+		result != static_cast<LONG>(NVSDK_NGX_Result_Success)) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR worker rejected initialization: state={} result={:#x}",
+			state, static_cast<uint32_t>(result)));
+		StopExternalWorker(impl);
+		return false;
+	}
+
+	Logger::Get().Info(fmt::format(
+		"DLSSNR external worker ready: session={} pid={} size={}x{} format={}",
+		std::string(impl.workerSession.begin(), impl.workerSession.end()),
+		GetProcessId(impl.workerProcess.get()),
+		impl.width, impl.height,
+		static_cast<uint32_t>(sharedDesc.Format)));
+	return true;
+}
+
 static bool WaitForFence(DLSSNRFilter::Impl& impl, uint64_t value) noexcept {
 	if (!value || impl.fence12->GetCompletedValue() >= value) {
 		return true;
@@ -1011,6 +1370,10 @@ static std::string FormatTimingSummary(
 }
 
 DLSSNRFilter::Impl::~Impl() {
+	if (workerMode) {
+		StopExternalWorker(*this);
+		return;
+	}
 	if (queue12 && fence12) {
 		WaitForQueue(*this);
 	}
@@ -1764,6 +2127,9 @@ DLSSNRFilter::~DLSSNRFilter() = default;
 FrameGuidanceRequirements
 DLSSNRFilter::GetFrameGuidanceRequirements() const noexcept {
 	if (!_impl || _impl->disabled) return {};
+	// Worker v1 deliberately uses zero motion/depth internally. This matches the
+	// already-validated bridge path; real cross-process guidance is phase 2.
+	if (_impl->workerMode) return {};
 	FrameGuidanceRequirements result{ .zero = true };
 	result.Add(_settings.motionRequest);
 	return result;
@@ -1934,7 +2300,74 @@ bool DLSSNRFilter::Initialize(
 		1u, static_cast<uint32_t>(std::lround(
 			double(inputDesc.Height) * double(resolutionPercent) / 100.0))) :
 		inputDesc.Height;
-	impl->convertInputToRgba = inputDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+\timpl->convertInputToRgba = inputDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+
+	if constexpr (USE_EXTERNAL_DLSSNR_WORKER) {
+		D3D11_TEXTURE2D_DESC sharedDesc = outputDesc;
+		sharedDesc.Format = experimentalHdrPath ?
+			DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+		sharedDesc.Width = impl->width;
+		sharedDesc.Height = impl->height;
+
+		if (!StartExternalWorker(*impl, sharedDesc, _settings)) {
+			return false;
+		}
+
+		HRESULT hr = S_OK;
+		if (impl->useResolutionScaling) {
+			if (!CreateResolutionScalingResources(
+				*impl, input, output, outputDesc)) {
+				StopExternalWorker(*impl);
+				return false;
+			}
+		} else if (impl->convertInputToRgba) {
+			hr = impl->device11->CreateShaderResourceView(
+				input, nullptr, impl->inputSrv11.put());
+			if (SUCCEEDED(hr)) {
+				hr = impl->device11->CreateUnorderedAccessView(
+					impl->sharedInput11.get(), nullptr,
+					impl->sharedInputUav11.put());
+			}
+			winrt::com_ptr<ID3DBlob> shaderBlob;
+			if (SUCCEEDED(hr) && !DirectXHelper::CompileComputeShader(
+				COLOR_CONVERT_HLSL, "ConvertToRgba", shaderBlob.put(),
+				"DLSSNRColorConvert")) {
+				hr = E_FAIL;
+			}
+			if (SUCCEEDED(hr)) {
+				hr = impl->device11->CreateComputeShader(
+					shaderBlob->GetBufferPointer(),
+					shaderBlob->GetBufferSize(),
+					nullptr, impl->colorConvertShader11.put());
+			}
+			if (FAILED(hr)) {
+				Logger::Get().ComError(
+					"Create DLSSNR BGRA conversion resources failed", hr);
+				StopExternalWorker(*impl);
+				return false;
+			}
+		}
+
+		LogDlssnrStatus(fmt::format(
+			"DLSSNR STATUS: Feature=18 created=true path=external-worker "
+			"sourceSize={}x{} sourceFormat={} inputSize={}x{} "
+			"inputResolutionScaling={} inputResolutionPercent={} "
+			"style={} intensity={} localTone={} localStructure={} skinStructure={} "
+			"autoMask={} uiCorrection={} guidance=worker-zero disabled=false",
+			impl->sourceWidth, impl->sourceHeight,
+			static_cast<uint32_t>(inputDesc.Format),
+			impl->width, impl->height,
+			impl->useResolutionScaling,
+			_settings.inputResolutionPercent,
+			_settings.style, _settings.intensity,
+			_settings.localToneStrength,
+			_settings.localStructureStrength,
+			_settings.skinStructureStrength,
+			_settings.useAutoMask,
+			_settings.uiCorrection));
+		_impl = std::move(impl);
+		return true;
+	}
 
 	if (!ngxCore.Acquire(resources, "DLSSNR")) {
 		return false;
@@ -2170,7 +2603,12 @@ bool DLSSNRFilter::Resize(
 }
 
 bool DLSSNRFilter::Drain() noexcept {
-	return !_impl || !_impl->queue12 || !_impl->fence12 || WaitForQueue(*_impl);
+	if (!_impl) return true;
+	if (_impl->workerMode) {
+		return !_impl->fenceValue ||
+			WaitForWorkerFence(*_impl, _impl->fenceValue, 10000);
+	}
+	return !_impl->queue12 || !_impl->fence12 || WaitForQueue(*_impl);
 }
 
 static FrameGuidanceView SelectGuidance(
@@ -2185,7 +2623,8 @@ static FrameGuidanceView SelectGuidance(
 }
 
 bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
-	if (!_impl || !_impl->feature || !_impl->parameters) {
+	if (!_impl ||
+		(!_impl->workerMode && (!_impl->feature || !_impl->parameters))) {
 		return false;
 	}
 	Impl& impl = *_impl;
@@ -2216,9 +2655,142 @@ bool DLSSNRFilter::Draw(const NativeEffectDrawContext& context) noexcept {
 	}
 	// A live upstream edit can change this input even for the same capture ID.
 	// Re-evaluate with fresh history instead of mixing it with the old image.
-	if (impl.lastEvaluatedInputRevision != context.inputRevision) {
+\tif (impl.lastEvaluatedInputRevision != context.inputRevision) {
 		impl.resetHistory = true;
 	}
+
+	if (impl.workerMode) {
+		auto failWorker = [&](std::string_view stage) noexcept {
+			impl.disabled = true;
+			LogDlssnrStatus(fmt::format(
+				"DLSSNR STATUS: Feature=18 frameId={} stage={} "
+				"path=external-worker result=internal-failure "
+				"disabled=true fallback=pass-through-next-frame",
+				context.frameId, stage), true);
+			return false;
+		};
+
+		if (!impl.workerProcess ||
+			WaitForSingleObject(
+				impl.workerProcess.get(), 0) == WAIT_OBJECT_0) {
+			return failWorker("worker-process-exited");
+		}
+
+		const auto inputPrepareStart =
+			NativeBackendTiming::Now();
+		if (!PrepareInput(impl, input)) {
+			return failWorker("prepare-input");
+		}
+		const double inputPrepareMs =
+			NativeBackendTiming::ElapsedMilliseconds(
+				inputPrepareStart);
+
+		if (impl.disabled) {
+			bool succeeded = true;
+			if (impl.useResolutionScaling) {
+				succeeded = CompositeResidual(
+					impl, output,
+					impl.sharedInputSrv11.get(),
+					_settings);
+			} else {
+				impl.context11->CopyResource(
+					output, impl.sharedInput11.get());
+			}
+			return succeeded;
+		}
+
+		PublishWorkerSettings(
+			impl, _settings, impl.resetHistory);
+
+		const uint64_t inputReady =
+			impl.fenceValue + 1;
+		const uint64_t outputReady =
+			inputReady + 1;
+		impl.fenceValue = outputReady;
+
+		HRESULT hr = impl.context11->Signal(
+			impl.fence11.get(), inputReady);
+		if (FAILED(hr)) {
+			return failWorker("worker-input-signal");
+		}
+		impl.context11->Flush();
+
+		const auto evaluateStart =
+			NativeBackendTiming::Now();
+		if (!WaitForWorkerFence(
+			impl, outputReady, 10000)) {
+			return failWorker("worker-output-wait");
+		}
+		const double evaluateCpuMs =
+			NativeBackendTiming::ElapsedMilliseconds(
+				evaluateStart);
+
+		const LONG workerResult =
+			impl.workerControl ?
+			InterlockedCompareExchange(
+				&impl.workerControl->lastResult, 0, 0) :
+			static_cast<LONG>(
+				NVSDK_NGX_Result_FAIL_NotInitialized);
+		const bool evaluateSucceeded =
+			workerResult ==
+			static_cast<LONG>(
+				NVSDK_NGX_Result_Success);
+
+		++impl.evaluateCount;
+		if (evaluateSucceeded) {
+			++impl.evaluateSuccessCount;
+		} else {
+			++impl.evaluateFailureCount;
+			return failWorker("worker-evaluate");
+		}
+
+		const auto submitStart =
+			NativeBackendTiming::Now();
+		if (impl.useResolutionScaling) {
+			if (!CompositeResidual(
+				impl, output,
+				impl.sharedOutputSrv11.get(),
+				_settings)) {
+				return failWorker("residual-composite");
+			}
+		} else {
+			impl.context11->CopyResource(
+				output, impl.sharedOutput11.get());
+		}
+		const double submitMs =
+			NativeBackendTiming::ElapsedMilliseconds(
+				submitStart);
+
+		if (impl.evaluateCount == 1 ||
+			(NativeBackendTiming::Enabled &&
+				(impl.evaluateCount <= 8 ||
+				 impl.evaluateCount % 120 == 0))) {
+			LogDlssnrStatus(fmt::format(
+				"DLSSNR STATUS: Feature=18 frameId={} evaluateCount={} "
+				"result={:#x} success={} failures={} "
+				"path=external-worker disabled=false",
+				context.frameId, impl.evaluateCount,
+				static_cast<uint32_t>(workerResult),
+				impl.evaluateSuccessCount,
+				impl.evaluateFailureCount));
+		}
+
+		if constexpr (NativeBackendTiming::Enabled) {
+			impl.inputPrepareTimings.Add(inputPrepareMs);
+			impl.evaluateCpuTimings.Add(evaluateCpuMs);
+			impl.submitTimings.Add(submitMs);
+		}
+
+		impl.resetHistory = false;
+		impl.residualParametersDirty = false;
+		impl.lastEvaluatedFrameId = context.frameId;
+		impl.lastEvaluatedParameterRevision =
+			impl.evaluateParameterRevision;
+		impl.lastEvaluatedInputRevision =
+			context.inputRevision;
+		return true;
+	}
+
 	auto fail = [&](std::string_view stage) noexcept {
 		impl.disabled = true;
 		LogDlssnrStatus(fmt::format(

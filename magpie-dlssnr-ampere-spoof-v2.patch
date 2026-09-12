@@ -1,0 +1,165 @@
+--- a/src/Magpie.Core/DLSSNRFilter.cpp
++++ b/src/Magpie.Core/DLSSNRFilter.cpp
+@@ -261,6 +261,123 @@
+ 	bool _installed = false;
+ };
+ 
++
++class ScopedDlssnrMinArchPatch {
++public:
++	ScopedDlssnrMinArchPatch() = default;
++	ScopedDlssnrMinArchPatch(const ScopedDlssnrMinArchPatch&) = delete;
++	ScopedDlssnrMinArchPatch& operator=(const ScopedDlssnrMinArchPatch&) = delete;
++
++	~ScopedDlssnrMinArchPatch() {
++		Remove();
++	}
++
++	bool Install(const std::filesystem::path& applicationDirectory) noexcept {
++		if (_installed) return true;
++
++		const std::filesystem::path dllPath =
++			applicationDirectory / L"nvngx_dlssnr.dll";
++		_module = LoadLibraryExW(
++			dllPath.c_str(), nullptr,
++			LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
++		if (!_module) {
++			Logger::Get().Win32Error(
++				"DLSSNR loader min-arch patch: LoadLibrary(nvngx_dlssnr.dll) failed");
++			return false;
++		}
++
++		_target = reinterpret_cast<uint8_t*>(
++			GetProcAddress(_module, "NVSDK_NGX_GetGPUArchitecture"));
++		if (!_target) {
++			Logger::Get().Error(
++				"DLSSNR loader min-arch patch: NVSDK_NGX_GetGPUArchitecture not found");
++			FreeLibrary(_module);
++			_module = nullptr;
++			return false;
++		}
++
++		constexpr std::array<uint8_t, 6> expected{
++			0xB8, 0xB0, 0x01, 0x00, 0x00, 0xC3
++		}; // mov eax, 0x1b0 ; ret
++		std::array<uint8_t, 6> current{};
++		std::memcpy(current.data(), _target, current.size());
++
++		if (current != expected) {
++			Logger::Get().Warn(fmt::format(
++				"DLSSNR loader min-arch patch: unexpected export bytes "
++				"{:02x} {:02x} {:02x} {:02x} {:02x} {:02x}; not patching",
++				static_cast<unsigned>(current[0]),
++				static_cast<unsigned>(current[1]),
++				static_cast<unsigned>(current[2]),
++				static_cast<unsigned>(current[3]),
++				static_cast<unsigned>(current[4]),
++				static_cast<unsigned>(current[5])));
++			FreeLibrary(_module);
++			_module = nullptr;
++			_target = nullptr;
++			return false;
++		}
++
++		_original = current;
++
++		DWORD oldProtection = 0;
++		if (!VirtualProtect(
++			_target, current.size(), PAGE_EXECUTE_READWRITE, &oldProtection)) {
++			Logger::Get().Win32Error(
++				"DLSSNR loader min-arch patch: VirtualProtect failed");
++			FreeLibrary(_module);
++			_module = nullptr;
++			_target = nullptr;
++			return false;
++		}
++
++		const uint32_t minimumArchitecture = NVAPI_ARCH_AMPERE;
++		std::memcpy(_target + 1, &minimumArchitecture, sizeof(minimumArchitecture));
++		FlushInstructionCache(GetCurrentProcess(), _target, current.size());
++
++		DWORD ignoredProtection = 0;
++		(void)VirtualProtect(
++			_target, current.size(), oldProtection, &ignoredProtection);
++
++		_installed = true;
++		Logger::Get().Info(
++			"DLSSNR loader min-arch patch: minimum 0x1b0 -> 0x170");
++		return true;
++	}
++
++private:
++	void Remove() noexcept {
++		if (!_installed || !_module || !_target) return;
++
++		DWORD oldProtection = 0;
++		if (VirtualProtect(
++			_target, _original.size(), PAGE_EXECUTE_READWRITE, &oldProtection)) {
++			std::memcpy(_target, _original.data(), _original.size());
++			FlushInstructionCache(
++				GetCurrentProcess(), _target, _original.size());
++			DWORD ignoredProtection = 0;
++			(void)VirtualProtect(
++				_target, _original.size(), oldProtection, &ignoredProtection);
++			Logger::Get().Info(
++				"DLSSNR loader min-arch patch: original export restored");
++		} else {
++			Logger::Get().Warn(
++				"DLSSNR loader min-arch patch: failed to restore export");
++		}
++
++		FreeLibrary(_module);
++		_module = nullptr;
++		_target = nullptr;
++		_installed = false;
++	}
++
++	HMODULE _module = nullptr;
++	uint8_t* _target = nullptr;
++	std::array<uint8_t, 6> _original{};
++	bool _installed = false;
++};
++
++
+ #else
+ 
+ class ScopedNvApiArchSpoof {
+@@ -272,6 +389,15 @@
+ 	}
+ };
+ 
++class ScopedDlssnrMinArchPatch {
++public:
++	bool Install(const std::filesystem::path&) noexcept {
++		Logger::Get().Warn(
++			"DLSSNR loader min-arch patch is only implemented for Windows x64");
++		return false;
++	}
++};
++
+ #endif
+ 
+ void LogDlssnrStatus(std::string message, bool error = false) noexcept {
+@@ -2148,6 +2274,13 @@
+ 		inputDesc.Height;
+ 	impl->convertInputToRgba = inputDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM;
+ 
++	const std::filesystem::path applicationDirectory =
++		Win32Helper::GetExePath().parent_path();
++	ScopedDlssnrMinArchPatch minArchPatch;
++	if (!minArchPatch.Install(applicationDirectory)) {
++		Logger::Get().Warn(
++			"DLSSNR loader min-arch patch unavailable; continuing without it");
++	}
+ 	if (!archSpoof.Install()) {
+ 		Logger::Get().Warn(
+ 			"DLSSNR NVAPI arch spoof unavailable; continuing without spoof");
+@@ -2277,8 +2410,6 @@
+ 		}
+ 	}
+ 
+-	const std::filesystem::path applicationDirectory =
+-		Win32Helper::GetExePath().parent_path();
+ 	DWORD sehCode = 0;
+ 	NVSDK_NGX_Result result = NVSDK_NGX_Result_Success;
+ 

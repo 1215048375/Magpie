@@ -1,0 +1,113 @@
+name: build DLSSNR worker backend
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-dlssnr-worker.yml'
+      - 'src/Magpie.Core/DLSSNRFilter.cpp'
+      - 'src/Magpie.Core/DLSSNRWorkerProtocol.h'
+      - 'tools/DLSSNR.Worker/**'
+      - 'src/BuildOptions.props'
+      - 'src/Common.Post.props'
+      - 'src/Magpie/Magpie.vcxproj'
+      - 'scripts/publish.py'
+
+jobs:
+  build:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Setup Conan
+        run: pip install conan
+
+      - name: Load Conan cache
+        uses: actions/cache@v6
+        with:
+          path: ~/.conan2/p
+          key: Conan-${{ hashFiles('src/**/conanfile.txt') }}-MSVC-x64
+
+      - name: Checkout NVIDIA DLSS SDK
+        uses: actions/checkout@v7
+        with:
+          repository: NVIDIA/DLSS
+          path: dependencies/dlss-sdk
+          lfs: true
+
+      - name: Enable DLSSNR for this build
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:GITHUB_WORKSPACE "dependencies\dlss-sdk"
+          $runtime = Join-Path $env:GITHUB_WORKSPACE "dependencies\dlssnr-runtime-placeholder"
+          New-Item -ItemType Directory -Force -Path $runtime | Out-Null
+
+          # Magpie's existing copy target expects a runtime when DLSSNR is enabled.
+          # Use a build-only placeholder and remove it from the final artifact;
+          # the user supplies the signed/community nvngx_dlssnr.dll locally.
+          New-Item -ItemType File -Force -Path (Join-Path $runtime "nvngx_dlssnr.dll") | Out-Null
+
+          @"
+          <Project>
+            <PropertyGroup>
+              <EnableDLSSSR>false</EnableDLSSSR>
+              <EnableDLSSFrameGeneration>false</EnableDLSSFrameGeneration>
+              <EnableDLSSNR>true</EnableDLSSNR>
+              <DLSSSdkDir>$sdk</DLSSSdkDir>
+              <DLSSNRRuntimeDir>$runtime</DLSSNRRuntimeDir>
+            </PropertyGroup>
+          </Project>
+          "@ | Set-Content -Encoding UTF8 "$env:GITHUB_WORKSPACE\src\BuildOptions.props.user"
+
+      - name: Build Magpie MSVC x64
+        shell: pwsh
+        run: python scripts/publish.py --compiler=MSVC --platform=x64
+
+      - name: Build nvngx.dll worker
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:GITHUB_WORKSPACE "dependencies\dlss-sdk"
+          $out = Join-Path $env:GITHUB_WORKSPACE "publish\x64"
+
+          msbuild `
+            "$env:GITHUB_WORKSPACE\tools\DLSSNR.Worker\DLSSNR.Worker.vcxproj" `
+            /m /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:DLSSSdkDir="$sdk" `
+            /p:WorkerOutDir="$out\" `
+            /v:minimal
+
+          if (!(Test-Path (Join-Path $out "nvngx.dll"))) {
+            throw "DLSSNR worker nvngx.dll was not built"
+          }
+
+          # Never publish the zero-byte placeholder.
+          Remove-Item (Join-Path $out "nvngx_dlssnr.dll") -Force -ErrorAction SilentlyContinue
+
+          @"
+          DLSSNR worker backend build
+
+          IMPORTANT:
+          Copy the same nvngx_dlssnr.dll that worked in the NeuralScreen/bridge
+          probe next to Magpie.exe before running DLSSNR.
+
+          nvngx.dll in this artifact is Magpie's executable DLSSNR worker.
+          Do not replace it with the NVIDIA Core DLL.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $out "DLSSNR-WORKER-README.txt")
+
+      - name: Save hash
+        id: hash
+        shell: pwsh
+        run: echo "sha_short=$(git rev-parse --short HEAD)" >> $env:GITHUB_OUTPUT
+
+      - name: Store build
+        uses: actions/upload-artifact@v7
+        with:
+          name: Magpie-DLSSNR-worker-${{ steps.hash.outputs.sha_short }}-MSVC-x64
+          path: ./publish/x64

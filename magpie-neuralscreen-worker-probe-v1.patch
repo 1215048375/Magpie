@@ -1,0 +1,789 @@
+diff --git a/.github/workflows/dlssnr-worker-probe.yml b/.github/workflows/dlssnr-worker-probe.yml
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/.github/workflows/dlssnr-worker-probe.yml
+@@ -0,0 +1,72 @@
++name: DLSSNR worker probe
++
++on:
++  workflow_dispatch:
++  push:
++    paths:
++      - '.github/workflows/dlssnr-worker-probe.yml'
++      - 'tools/DLSSNR.Worker/**'
++
++jobs:
++  worker-probe:
++    runs-on: windows-2025-vs2026
++
++    steps:
++      - name: Checkout Magpie
++        uses: actions/checkout@v7
++
++      - name: Checkout NVIDIA DLSS SDK
++        uses: actions/checkout@v7
++        with:
++          repository: NVIDIA/DLSS
++          path: dependencies/dlss-sdk
++          lfs: true
++
++      - name: Setup MSBuild
++        uses: microsoft/setup-msbuild@v2
++
++      - name: Build nvngx.dll worker probe
++        shell: pwsh
++        run: |
++          $sdk = Join-Path $env:GITHUB_WORKSPACE "dependencies\dlss-sdk"
++          $out = Join-Path $env:GITHUB_WORKSPACE "worker-probe"
++
++          New-Item -ItemType Directory -Force -Path $out | Out-Null
++
++          msbuild `
++            "$env:GITHUB_WORKSPACE\tools\DLSSNR.Worker\DLSSNR.Worker.vcxproj" `
++            /m `
++            /t:Rebuild `
++            /p:Configuration=Release `
++            /p:Platform=x64 `
++            /p:DLSSSdkDir="$sdk" `
++            /p:WorkerOutDir="$out\" `
++            /v:minimal
++
++          if (!(Test-Path (Join-Path $out "nvngx.dll"))) {
++            throw "worker build completed without nvngx.dll"
++          }
++
++          Copy-Item `
++            "$env:GITHUB_WORKSPACE\tools\DLSSNR.Worker\run-worker-probe.ps1" `
++            (Join-Path $out "run-worker-probe.ps1")
++
++          @"
++          Magpie DLSSNR worker probe
++
++          1. Copy your existing nvngx_dlssnr.dll into this folder.
++          2. Right-click run-worker-probe.ps1 -> Run with PowerShell,
++             or run:
++               powershell -ExecutionPolicy Bypass -File .\run-worker-probe.ps1
++          3. Send magpie-dlssnr-worker-probe.log back for analysis.
++
++          Important:
++          nvngx.dll here is an executable PE intentionally named .dll.
++          Do not load it with rundll32.
++          "@ | Set-Content -Encoding UTF8 (Join-Path $out "README.txt")
++
++      - name: Upload worker probe
++        uses: actions/upload-artifact@v7
++        with:
++          name: Magpie-DLSSNR-worker-probe-x64
++          path: worker-probe
+
+diff --git a/tools/DLSSNR.Worker/DLSSNR.Worker.vcxproj b/tools/DLSSNR.Worker/DLSSNR.Worker.vcxproj
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.Worker/DLSSNR.Worker.vcxproj
+@@ -0,0 +1,78 @@
++<?xml version="1.0" encoding="utf-8"?>
++<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
++  <ItemGroup Label="ProjectConfigurations">
++    <ProjectConfiguration Include="Release|x64">
++      <Configuration>Release</Configuration>
++      <Platform>x64</Platform>
++    </ProjectConfiguration>
++  </ItemGroup>
++
++  <PropertyGroup Label="Globals">
++    <ProjectGuid>{3E8E8B80-5F93-4B90-9C6E-45A1891142E7}</ProjectGuid>
++    <Keyword>Win32Proj</Keyword>
++    <RootNamespace>MagpieDLSSNRWorkerProbe</RootNamespace>
++    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
++  </PropertyGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
++
++  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
++    <ConfigurationType>Application</ConfigurationType>
++    <UseDebugLibraries>false</UseDebugLibraries>
++    <WholeProgramOptimization>true</WholeProgramOptimization>
++    <CharacterSet>Unicode</CharacterSet>
++  </PropertyGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
++
++  <PropertyGroup>
++    <DLSSSdkDir Condition="'$(DLSSSdkDir)'==''">$(MSBuildThisFileDirectory)..\..\dependencies\dlss-sdk</DLSSSdkDir>
++    <OutDir Condition="'$(WorkerOutDir)'!=''">$(WorkerOutDir)</OutDir>
++    <OutDir Condition="'$(WorkerOutDir)'==''">$(MSBuildThisFileDirectory)bin\</OutDir>
++    <IntDir>$(MSBuildThisFileDirectory)obj\$(Configuration)\</IntDir>
++
++    <!-- NeuralScreen's load-bearing quirk: executable image name contains nvngx.dll. -->
++    <TargetName>nvngx</TargetName>
++    <TargetExt>.dll</TargetExt>
++  </PropertyGroup>
++
++  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
++    <ClCompile>
++      <WarningLevel>Level4</WarningLevel>
++      <TreatWarningAsError>false</TreatWarningAsError>
++      <Optimization>MaxSpeed</Optimization>
++      <FunctionLevelLinking>true</FunctionLevelLinking>
++      <IntrinsicFunctions>true</IntrinsicFunctions>
++      <SDLCheck>true</SDLCheck>
++      <LanguageStandard>stdcpp20</LanguageStandard>
++      <PreprocessorDefinitions>
++        WIN32;_WINDOWS;UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)
++      </PreprocessorDefinitions>
++      <AdditionalIncludeDirectories>
++        $(DLSSSdkDir)\include;%(AdditionalIncludeDirectories)
++      </AdditionalIncludeDirectories>
++    </ClCompile>
++
++    <Link>
++      <SubSystem>Console</SubSystem>
++      <EnableCOMDATFolding>true</EnableCOMDATFolding>
++      <OptimizeReferences>true</OptimizeReferences>
++      <GenerateDebugInformation>false</GenerateDebugInformation>
++      <AdditionalDependencies>
++        $(DLSSSdkDir)\lib\Windows_x86_64\x64\nvsdk_ngx_d.lib;
++        d3d12.lib;
++        dxgi.lib;
++        dxguid.lib;
++        user32.lib;
++        advapi32.lib;
++        %(AdditionalDependencies)
++      </AdditionalDependencies>
++    </Link>
++  </ItemDefinitionGroup>
++
++  <ItemGroup>
++    <ClCompile Include="nvngx_worker_probe.cpp" />
++  </ItemGroup>
++
++  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
++</Project>
+
+diff --git a/tools/DLSSNR.Worker/nvngx_worker_probe.cpp b/tools/DLSSNR.Worker/nvngx_worker_probe.cpp
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.Worker/nvngx_worker_probe.cpp
+@@ -0,0 +1,588 @@
++// Magpie DLSSNR worker probe
++// Phase A: reproduce NeuralScreen's process topology before adding IPC.
++// This is an executable PE intentionally named "nvngx.dll".
++//
++// Runtime layout:
++//   nvngx.dll               <- this executable
++//   nvngx_dlssnr.dll        <- supplied separately by the user
++//
++// The probe does NOT process frames.  It answers one question:
++// can an independent process whose image name contains "nvngx.dll" create
++// DLSSNR Feature 18 on this machine?
++
++#define WIN32_LEAN_AND_MEAN
++#define NOMINMAX
++#include <Windows.h>
++#include <d3d12.h>
++#include <dxgi1_6.h>
++#include <wrl/client.h>
++
++#include <nvsdk_ngx.h>
++#include <nvsdk_ngx_defs.h>
++
++#include <array>
++#include <atomic>
++#include <cstdint>
++#include <cstdarg>
++#include <cwctype>
++#include <cstdio>
++#include <cstring>
++#include <filesystem>
++#include <mutex>
++#include <string>
++
++using Microsoft::WRL::ComPtr;
++
++namespace {
++
++constexpr unsigned long long kDlssNrApplicationId = 0x0876232Cull;
++constexpr NVSDK_NGX_Feature kFeatureDlssNr =
++    static_cast<NVSDK_NGX_Feature>(18);
++
++constexpr uint32_t kNvapiIdGpuGetArchInfo = 0xD8265D24u;
++constexpr uint32_t kArchAmpere = 0x0170u;
++constexpr uint32_t kArchBlackwell2 = 0x01B0u;
++constexpr size_t kHookSize = 12;
++
++FILE* g_log = nullptr;
++
++void Log(const char* fmt, ...) {
++    va_list args;
++    va_start(args, fmt);
++    if (g_log) {
++        vfprintf(g_log, fmt, args);
++        fputc('\n', g_log);
++        fflush(g_log);
++    }
++    va_end(args);
++
++    va_start(args, fmt);
++    vprintf(fmt, args);
++    fputc('\n', stdout);
++    fflush(stdout);
++    va_end(args);
++}
++
++std::filesystem::path ExePath() {
++    std::wstring buf(32768, L'\0');
++    DWORD n = GetModuleFileNameW(nullptr, buf.data(), static_cast<DWORD>(buf.size()));
++    if (!n || n >= buf.size()) {
++        return {};
++    }
++    buf.resize(n);
++    return std::filesystem::path(buf);
++}
++
++struct NvGpuArchInfoCompat {
++    uint32_t version;
++    uint32_t architecture;
++    uint32_t implementation;
++    uint32_t revision;
++};
++
++using NvApiQueryInterfaceFn = void* (__cdecl*)(uint32_t);
++using NvApiGpuGetArchInfoFn = int (__cdecl*)(void*, NvGpuArchInfoCompat*);
++
++std::mutex g_archMutex;
++NvApiGpuGetArchInfoFn g_archReal = nullptr;
++std::array<uint8_t, kHookSize> g_archOriginal{};
++bool g_archPatched = false;
++std::atomic<bool> g_archRewriteLogged = false;
++
++bool WriteArchHook(bool enable);
++
++int __cdecl HookedGpuGetArchInfo(void* gpu, NvGpuArchInfoCompat* info) {
++    std::lock_guard lock(g_archMutex);
++
++    // Restore NVIDIA's original prologue while calling the real function.
++    if (!WriteArchHook(false)) {
++        return -1;
++    }
++
++    const int status = g_archReal ? g_archReal(gpu, info) : -1;
++
++    // Re-arm before returning to the caller.
++    WriteArchHook(true);
++
++    if (status == 0 && info) {
++        const uint32_t realArch = info->architecture;
++        if (realArch == kArchAmpere) {
++            info->architecture = kArchBlackwell2;
++            if (!g_archRewriteLogged.exchange(true)) {
++                Log("ARCH: NvAPI_GPU_GetArchInfo real=0x%03x spoofed=0x%03x",
++                    realArch, info->architecture);
++            }
++        } else if (!g_archRewriteLogged.exchange(true)) {
++            Log("ARCH: NvAPI_GPU_GetArchInfo observed architecture=0x%03x (not rewritten)",
++                realArch);
++        }
++    }
++    return status;
++}
++
++bool WriteArchHook(bool enable) {
++    if (!g_archReal) {
++        return false;
++    }
++
++    auto* target = reinterpret_cast<uint8_t*>(
++        reinterpret_cast<uintptr_t>(g_archReal));
++
++    DWORD oldProtect = 0;
++    if (!VirtualProtect(target, kHookSize, PAGE_EXECUTE_READWRITE, &oldProtect)) {
++        return false;
++    }
++
++    if (enable) {
++        // mov rax, imm64
++        // jmp rax
++        std::array<uint8_t, kHookSize> patch{
++            0x48, 0xB8, 0,0,0,0,0,0,0,0, 0xFF, 0xE0
++        };
++        const uint64_t handler =
++            reinterpret_cast<uint64_t>(&HookedGpuGetArchInfo);
++        std::memcpy(patch.data() + 2, &handler, sizeof(handler));
++        std::memcpy(target, patch.data(), patch.size());
++        g_archPatched = true;
++    } else {
++        std::memcpy(target, g_archOriginal.data(), g_archOriginal.size());
++        g_archPatched = false;
++    }
++
++    FlushInstructionCache(GetCurrentProcess(), target, kHookSize);
++
++    DWORD ignored = 0;
++    VirtualProtect(target, kHookSize, oldProtect, &ignored);
++    return true;
++}
++
++class ScopedArchSpoof {
++public:
++    bool Install() {
++        _module = LoadLibraryW(L"nvapi64.dll");
++        if (!_module) {
++            Log("ARCH: LoadLibraryW(nvapi64.dll) failed: %lu", GetLastError());
++            return false;
++        }
++
++        auto query = reinterpret_cast<NvApiQueryInterfaceFn>(
++            GetProcAddress(_module, "nvapi_QueryInterface"));
++        if (!query) {
++            Log("ARCH: nvapi_QueryInterface not found");
++            return false;
++        }
++
++        g_archReal = reinterpret_cast<NvApiGpuGetArchInfoFn>(
++            query(kNvapiIdGpuGetArchInfo));
++        if (!g_archReal) {
++            Log("ARCH: NvAPI_GPU_GetArchInfo query returned null");
++            return false;
++        }
++
++        std::memcpy(
++            g_archOriginal.data(),
++            reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(g_archReal)),
++            g_archOriginal.size());
++
++        if (!WriteArchHook(true)) {
++            Log("ARCH: failed to patch NvAPI_GPU_GetArchInfo");
++            return false;
++        }
++
++        Log("ARCH: NvAPI_GPU_GetArchInfo hook installed");
++        _installed = true;
++        return true;
++    }
++
++    ~ScopedArchSpoof() {
++        if (_installed && g_archReal && g_archPatched) {
++            std::lock_guard lock(g_archMutex);
++            WriteArchHook(false);
++            Log("ARCH: hook removed");
++        }
++        g_archReal = nullptr;
++        if (_module) {
++            FreeLibrary(_module);
++        }
++    }
++
++private:
++    HMODULE _module = nullptr;
++    bool _installed = false;
++};
++
++ComPtr<IDXGIAdapter1> PickNvidiaAdapter() {
++    ComPtr<IDXGIFactory6> factory;
++    if (FAILED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
++        return {};
++    }
++
++    for (UINT i = 0;; ++i) {
++        ComPtr<IDXGIAdapter1> adapter;
++        HRESULT hr = factory->EnumAdapterByGpuPreference(
++            i,
++            DXGI_GPU_PREFERENCE_HIGH_PERFORMANCE,
++            IID_PPV_ARGS(&adapter));
++        if (hr == DXGI_ERROR_NOT_FOUND) {
++            break;
++        }
++        if (FAILED(hr)) {
++            continue;
++        }
++
++        DXGI_ADAPTER_DESC1 desc{};
++        if (FAILED(adapter->GetDesc1(&desc))) {
++            continue;
++        }
++        if ((desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) != 0) {
++            continue;
++        }
++
++        Log("DXGI: candidate vendor=0x%04x device=0x%04x dedicatedVRAM=%llu MiB",
++            desc.VendorId,
++            desc.DeviceId,
++            static_cast<unsigned long long>(
++                desc.DedicatedVideoMemory / (1024ull * 1024ull)));
++
++        if (desc.VendorId == 0x10DE) {
++            char name[256]{};
++            WideCharToMultiByte(
++                CP_UTF8, 0, desc.Description, -1,
++                name, static_cast<int>(sizeof(name)), nullptr, nullptr);
++            Log("DXGI: selected %s", name);
++            return adapter;
++        }
++    }
++    return {};
++}
++
++using SnippetInitExtFn = NVSDK_NGX_Result (NVSDK_CONV*)(
++    unsigned long long,
++    const wchar_t*,
++    ID3D12Device*,
++    NVSDK_NGX_Version,
++    const NVSDK_NGX_Parameter*);
++
++using SnippetCreateFeatureFn = NVSDK_NGX_Result (NVSDK_CONV*)(
++    ID3D12GraphicsCommandList*,
++    NVSDK_NGX_Feature,
++    NVSDK_NGX_Parameter*,
++    NVSDK_NGX_Handle**);
++
++using SnippetReleaseFeatureFn =
++    NVSDK_NGX_Result (NVSDK_CONV*)(NVSDK_NGX_Handle*);
++
++using SnippetShutdownFn =
++    NVSDK_NGX_Result (NVSDK_CONV*)(ID3D12Device*);
++
++NVSDK_NGX_Result NVSDK_CONV ScalingRatioCallback(
++    NVSDK_NGX_Parameter* parameters) {
++    if (!parameters) {
++        return NVSDK_NGX_Result_FAIL_InvalidParameter;
++    }
++    parameters->Set("DLSSNR.ScalingRatio", 1.0f);
++    return NVSDK_NGX_Result_Success;
++}
++
++void SetCreateParameters(NVSDK_NGX_Parameter* p, uint32_t width, uint32_t height) {
++    p->Set("DLSSNR.Width", width);
++    p->Set("DLSSNR.Height", height);
++    p->Set("DLSSNR.InputWidth", width);
++    p->Set("DLSSNR.InputHeight", height);
++    p->Set("DLSSNR.OutputWidth", width);
++    p->Set("DLSSNR.OutputHeight", height);
++    p->Set("DLSSNR.Output.Width", width);
++    p->Set("DLSSNR.Output.Height", height);
++
++    // Same-resolution NR.
++    p->Set("DLSSNR.Upscaling", 0u);
++    p->Set("DLSSNR.Scale", 1.0f);
++    p->Set("DLSSNR.ScalingRatio", 1.0f);
++    p->Set(
++        "DLSSNRComputeScalingRatioCallback",
++        reinterpret_cast<void*>(
++            reinterpret_cast<uintptr_t>(&ScalingRatioCallback)));
++
++    p->Set("DLSSNR.Hint.Render.Preset", 0);
++
++    // Keep the generic fields too; the DLSSNR.* fields above are the
++    // load-bearing ones for Feature 18.
++    p->Set(NVSDK_NGX_Parameter_Width, width);
++    p->Set(NVSDK_NGX_Parameter_Height, height);
++    p->Set(
++        NVSDK_NGX_Parameter_PerfQualityValue,
++        static_cast<int>(NVSDK_NGX_PerfQuality_Value_Balanced));
++    p->Set(NVSDK_NGX_Parameter_CreationNodeMask, 1u);
++    p->Set(NVSDK_NGX_Parameter_VisibilityNodeMask, 1u);
++}
++
++template <typename T>
++T Export(HMODULE module, const char* name) {
++    return reinterpret_cast<T>(GetProcAddress(module, name));
++}
++
++int RunProbe() {
++    const auto exe = ExePath();
++    if (exe.empty()) {
++        Log("FATAL: cannot resolve executable path");
++        return 2;
++    }
++
++    const auto dir = exe.parent_path();
++    Log("PROCESS: %ls", exe.c_str());
++
++    std::wstring lower = exe.filename().wstring();
++    for (auto& c : lower) {
++        c = static_cast<wchar_t>(towlower(c));
++    }
++    if (lower.find(L"nvngx.dll") == std::wstring::npos) {
++        Log("FATAL: process image name does not contain nvngx.dll");
++        return 3;
++    }
++
++    const auto snippetPath = dir / L"nvngx_dlssnr.dll";
++    if (!std::filesystem::exists(snippetPath)) {
++        Log("FATAL: %ls is missing", snippetPath.c_str());
++        return 4;
++    }
++    Log("RUNTIME: %ls", snippetPath.c_str());
++
++    ScopedArchSpoof archSpoof;
++    if (!archSpoof.Install()) {
++        Log("FATAL: architecture hook could not be installed");
++        return 5;
++    }
++
++    auto adapter = PickNvidiaAdapter();
++    if (!adapter) {
++        Log("FATAL: no NVIDIA DXGI adapter found");
++        return 6;
++    }
++
++    ComPtr<ID3D12Device> device;
++    HRESULT hr = D3D12CreateDevice(
++        adapter.Get(),
++        D3D_FEATURE_LEVEL_11_0,
++        IID_PPV_ARGS(&device));
++    if (FAILED(hr)) {
++        Log("FATAL: D3D12CreateDevice failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 7;
++    }
++    Log("D3D12: device created");
++
++    D3D12_COMMAND_QUEUE_DESC queueDesc{};
++    queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
++
++    ComPtr<ID3D12CommandQueue> queue;
++    hr = device->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(&queue));
++    if (FAILED(hr)) {
++        Log("FATAL: CreateCommandQueue failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 8;
++    }
++
++    ComPtr<ID3D12CommandAllocator> allocator;
++    hr = device->CreateCommandAllocator(
++        D3D12_COMMAND_LIST_TYPE_DIRECT,
++        IID_PPV_ARGS(&allocator));
++    if (FAILED(hr)) {
++        Log("FATAL: CreateCommandAllocator failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 9;
++    }
++
++    ComPtr<ID3D12GraphicsCommandList> list;
++    hr = device->CreateCommandList(
++        0,
++        D3D12_COMMAND_LIST_TYPE_DIRECT,
++        allocator.Get(),
++        nullptr,
++        IID_PPV_ARGS(&list));
++    if (FAILED(hr)) {
++        Log("FATAL: CreateCommandList failed hr=0x%08x",
++            static_cast<unsigned>(hr));
++        return 10;
++    }
++
++    // NeuralScreen-style split:
++    // 1. Core owns capability parameters.
++    // 2. Signed DLSSNR snippet owns Feature 18.
++    NVSDK_NGX_Result ngx = NVSDK_NGX_D3D12_Init(
++        kDlssNrApplicationId,
++        dir.c_str(),
++        device.Get());
++
++    Log("NGX CORE: Init(appId=0x%08llx) -> 0x%08x",
++        kDlssNrApplicationId,
++        static_cast<unsigned>(ngx));
++
++    if (ngx != NVSDK_NGX_Result_Success) {
++        Log("STOP: Core Init did not succeed; capability block is unavailable.");
++        return 20;
++    }
++
++    NVSDK_NGX_Parameter* params = nullptr;
++    ngx = NVSDK_NGX_D3D12_GetCapabilityParameters(&params);
++    Log("NGX CORE: GetCapabilityParameters -> 0x%08x params=%p",
++        static_cast<unsigned>(ngx),
++        static_cast<void*>(params));
++
++    if (ngx != NVSDK_NGX_Result_Success || !params) {
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 21;
++    }
++
++    HMODULE snippet = LoadLibraryExW(
++        snippetPath.c_str(),
++        nullptr,
++        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR |
++            LOAD_LIBRARY_SEARCH_DEFAULT_DIRS);
++
++    if (!snippet) {
++        Log("FATAL: LoadLibraryExW(nvngx_dlssnr.dll) failed win32=%lu",
++            GetLastError());
++        NVSDK_NGX_D3D12_DestroyParameters(params);
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 22;
++    }
++
++    auto initExt = Export<SnippetInitExtFn>(
++        snippet, "NVSDK_NGX_D3D12_Init_Ext");
++    auto createFeature = Export<SnippetCreateFeatureFn>(
++        snippet, "NVSDK_NGX_D3D12_CreateFeature");
++    auto releaseFeature = Export<SnippetReleaseFeatureFn>(
++        snippet, "NVSDK_NGX_D3D12_ReleaseFeature");
++    auto snippetShutdown = Export<SnippetShutdownFn>(
++        snippet, "NVSDK_NGX_D3D12_Shutdown1");
++
++    // Diagnostic only: different Feature 18 builds expose this under
++    // different names. We log presence but do not call an unknown ABI.
++    FARPROC populate = GetProcAddress(
++        snippet, "NVSDK_NGX_D3D12_PopulateParameters_Impl");
++    if (!populate) {
++        populate = GetProcAddress(snippet, "PopulateParameters_Impl");
++    }
++
++    Log("SNIPPET exports: Init_Ext=%p CreateFeature=%p ReleaseFeature=%p "
++        "Shutdown1=%p PopulateParameters_Impl=%p",
++        reinterpret_cast<void*>(initExt),
++        reinterpret_cast<void*>(createFeature),
++        reinterpret_cast<void*>(releaseFeature),
++        reinterpret_cast<void*>(snippetShutdown),
++        reinterpret_cast<void*>(populate));
++
++    if (!initExt || !createFeature || !releaseFeature || !snippetShutdown) {
++        Log("FATAL: required signed-snippet exports are incomplete");
++        FreeLibrary(snippet);
++        NVSDK_NGX_D3D12_DestroyParameters(params);
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 23;
++    }
++
++    ngx = initExt(
++        kDlssNrApplicationId,
++        dir.c_str(),
++        device.Get(),
++        NVSDK_NGX_Version_API,
++        params);
++
++    Log("SNIPPET: Init_Ext(core capability block) -> 0x%08x",
++        static_cast<unsigned>(ngx));
++
++    if (ngx != NVSDK_NGX_Result_Success) {
++        FreeLibrary(snippet);
++        NVSDK_NGX_D3D12_DestroyParameters(params);
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++        return 24;
++    }
++
++    constexpr uint32_t kProbeWidth = 1280;
++    constexpr uint32_t kProbeHeight = 720;
++    SetCreateParameters(params, kProbeWidth, kProbeHeight);
++
++    NVSDK_NGX_Handle* feature = nullptr;
++    ngx = createFeature(
++        list.Get(),
++        kFeatureDlssNr,
++        params,
++        &feature);
++
++    Log("SNIPPET: CreateFeature(18, %ux%u) -> 0x%08x handle=%p",
++        kProbeWidth,
++        kProbeHeight,
++        static_cast<unsigned>(ngx),
++        static_cast<void*>(feature));
++
++    if (ngx == NVSDK_NGX_Result_Success && feature) {
++        hr = list->Close();
++        if (SUCCEEDED(hr)) {
++            ID3D12CommandList* lists[]{ list.Get() };
++            queue->ExecuteCommandLists(1, lists);
++
++            ComPtr<ID3D12Fence> fence;
++            if (SUCCEEDED(device->CreateFence(
++                    0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence)))) {
++                HANDLE eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++                if (eventHandle) {
++                    queue->Signal(fence.Get(), 1);
++                    if (fence->GetCompletedValue() < 1) {
++                        fence->SetEventOnCompletion(1, eventHandle);
++                        WaitForSingleObject(eventHandle, 10000);
++                    }
++                    CloseHandle(eventHandle);
++                }
++            }
++        } else {
++            Log("WARN: command list close failed hr=0x%08x",
++                static_cast<unsigned>(hr));
++        }
++
++        Log("SUCCESS: DLSSNR Feature 18 created in nvngx.dll worker");
++        releaseFeature(feature);
++    } else {
++        Log("FAIL: Feature 18 was not created");
++    }
++
++    const NVSDK_NGX_Result snippetShutdownResult =
++        snippetShutdown(device.Get());
++    Log("SNIPPET: Shutdown1 -> 0x%08x",
++        static_cast<unsigned>(snippetShutdownResult));
++
++    FreeLibrary(snippet);
++
++    const NVSDK_NGX_Result destroyResult =
++        NVSDK_NGX_D3D12_DestroyParameters(params);
++    Log("NGX CORE: DestroyParameters -> 0x%08x",
++        static_cast<unsigned>(destroyResult));
++
++    const NVSDK_NGX_Result shutdownResult =
++        NVSDK_NGX_D3D12_Shutdown1(device.Get());
++    Log("NGX CORE: Shutdown1 -> 0x%08x",
++        static_cast<unsigned>(shutdownResult));
++
++    return (ngx == NVSDK_NGX_Result_Success && feature) ? 0 : 30;
++}
++
++} // namespace
++
++int wmain() {
++    const auto exe = ExePath();
++    const auto logPath =
++        (exe.empty() ? std::filesystem::path(L".") : exe.parent_path()) /
++        L"magpie-dlssnr-worker-probe.log";
++
++    _wfopen_s(&g_log, logPath.c_str(), L"w, ccs=UTF-8");
++
++    Log("=== Magpie NeuralScreen-style DLSSNR worker probe ===");
++    Log("This binary is intentionally an executable PE named nvngx.dll.");
++
++    const int rc = RunProbe();
++    Log("EXIT: %d", rc);
++
++    if (g_log) {
++        fclose(g_log);
++        g_log = nullptr;
++    }
++    return rc;
++}
+
+diff --git a/tools/DLSSNR.Worker/run-worker-probe.ps1 b/tools/DLSSNR.Worker/run-worker-probe.ps1
+new file mode 100644
+index 0000000..1111111
+--- /dev/null
++++ b/tools/DLSSNR.Worker/run-worker-probe.ps1
+@@ -0,0 +1,24 @@
++$ErrorActionPreference = "Stop"
++
++$worker = Join-Path $PSScriptRoot "nvngx.dll"
++$runtime = Join-Path $PSScriptRoot "nvngx_dlssnr.dll"
++
++if (!(Test-Path $worker)) {
++    throw "nvngx.dll worker not found: $worker"
++}
++if (!(Test-Path $runtime)) {
++    throw "Copy your nvngx_dlssnr.dll next to nvngx.dll first."
++}
++
++# Do not use ShellExecute: nvngx.dll is an executable PE with a .dll filename.
++$psi = [System.Diagnostics.ProcessStartInfo]::new()
++$psi.FileName = $worker
++$psi.WorkingDirectory = $PSScriptRoot
++$psi.UseShellExecute = $false
++
++$p = [System.Diagnostics.Process]::Start($psi)
++$p.WaitForExit()
++
++Write-Host "worker exit code:" $p.ExitCode
++Write-Host "log:" (Join-Path $PSScriptRoot "magpie-dlssnr-worker-probe.log")
++exit $p.ExitCode

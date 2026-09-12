@@ -1,0 +1,13 @@
+diff --git a/tools/DLSSNR.Worker/nvngx_worker_probe.cpp b/tools/DLSSNR.Worker/nvngx_worker_probe.cpp
+--- a/tools/DLSSNR.Worker/nvngx_worker_probe.cpp
++++ b/tools/DLSSNR.Worker/nvngx_worker_probe.cpp
+@@ -417,7 +417,7 @@ int wmain() {
+     const auto logPath =
+         (exe.empty() ? std::filesystem::path(L".") : exe.parent_path()) /
+         L"magpie-dlssnr-worker-probe.log";
+
+-    _wfopen_s(&g_log, logPath.c_str(), L"w, ccs=UTF-8");
++    _wfopen_s(&g_log, logPath.c_str(), L"wb");
+
+     Log("=== Magpie NeuralScreen-style DLSSNR worker probe ===");
+     Log("This binary is intentionally an executable PE named nvngx.dll.");

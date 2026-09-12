@@ -1,0 +1,11 @@
+diff --git a/tools/DLSSNR.Worker/DLSSNR.Worker.vcxproj b/tools/DLSSNR.Worker/DLSSNR.Worker.vcxproj
+--- a/tools/DLSSNR.Worker/DLSSNR.Worker.vcxproj
++++ b/tools/DLSSNR.Worker/DLSSNR.Worker.vcxproj
+@@ -16,6 +16,7 @@
+   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+     <ConfigurationType>Application</ConfigurationType>
+     <UseDebugLibraries>false</UseDebugLibraries>
++    <PlatformToolset>v145</PlatformToolset>
+     <WholeProgramOptimization>true</WholeProgramOptimization>
+     <CharacterSet>Unicode</CharacterSet>
+   </PropertyGroup>
