@@ -2,20 +2,84 @@ name: build
 
 on:
   push:
-    paths: [ '.github/workflows/build.yml', 'Magpie.slnx', '*.props', 'scripts/publish.py', 'src/**' ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'Magpie.slnx'
+      - '*.props'
+      - 'scripts/publish.py'
+      - 'src/**'
   pull_request:
-    paths: [ '.github/workflows/build.yml', 'Magpie.slnx', '*.props', 'scripts/publish.py', 'src/**' ]
+    paths:
+      - '.github/workflows/build.yml'
+      - 'Magpie.slnx'
+      - '*.props'
+      - 'scripts/publish.py'
+      - 'src/**'
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-2025-vs2026
+
     strategy:
       matrix:
         compiler: ["MSVC"]
         platform: ["x64"]
 
     steps:
-    - uses: actions/checkout@v7
+    - name: Checkout Magpie
+      uses: actions/checkout@v7
+
+    - name: Checkout NVIDIA DLSS SDK
+      uses: actions/checkout@v7
+      with:
+        repository: NVIDIA/DLSS
+        path: dependencies/dlss-sdk
+        lfs: true
+
+    - name: Enable DLSSNR
+      shell: pwsh
+      run: |
+        $sdk = Join-Path $env:GITHUB_WORKSPACE "dependencies\dlss-sdk"
+
+        $header = Join-Path $sdk "include\nvsdk_ngx.h"
+        $lib = Join-Path $sdk "lib\Windows_x86_64\x64\nvsdk_ngx_d.lib"
+
+        if (!(Test-Path $header)) {
+          throw "nvsdk_ngx.h not found: $header"
+        }
+
+        if (!(Test-Path $lib)) {
+          throw "nvsdk_ngx_d.lib not found: $lib"
+        }
+
+        $props = @"
+        <Project>
+          <PropertyGroup>
+            <EnableDLSSSR>false</EnableDLSSSR>
+            <EnableDLSSFrameGeneration>false</EnableDLSSFrameGeneration>
+
+            <EnableDLSSNR>true</EnableDLSSNR>
+            <DLSSSdkDir>$sdk</DLSSSdkDir>
+            <DLSSNRRuntimeDir></DLSSNRRuntimeDir>
+          </PropertyGroup>
+        </Project>
+        "@
+
+        $propsPath = Join-Path $env:GITHUB_WORKSPACE "src\BuildOptions.props.user"
+
+        Set-Content `
+          -Path $propsPath `
+          -Value $props `
+          -Encoding utf8
+
+        Write-Host "===== BuildOptions.props.user ====="
+        Get-Content $propsPath
+
+        Write-Host "===== NVIDIA DLSS SDK ====="
+        Write-Host "SDK:    $sdk"
+        Write-Host "Header: $header"
+        Write-Host "Lib:    $lib"
 
     - uses: actions/setup-python@v6
       with:
@@ -31,12 +95,7 @@ jobs:
         key: Conan-${{ hashFiles('src/**/conanfile.txt') }}-${{ matrix.compiler }}-${{ matrix.platform }}
 
     - name: Build
-      if: github.ref != 'refs/heads/dev' && github.ref != 'refs/heads/main'
       run: python scripts/publish.py --compiler=${{ matrix.compiler }} --platform=${{ matrix.platform }}
-
-    - name: Build and sign
-      if: github.ref == 'refs/heads/dev' || github.ref == 'refs/heads/main'
-      run: python scripts/publish.py --compiler=${{ matrix.compiler }} --platform=${{ matrix.platform }} --pfx-path=certs\Magpie.pfx --pfx-password="${{ secrets.MAGPIE_PFX_PASSWORD }}"
 
     - name: Save hash
       id: hash
@@ -44,6 +103,6 @@ jobs:
 
     - name: Store build
       uses: actions/upload-artifact@v7
-      with: 
-          name: Magpie-dev-${{ steps.hash.outputs.sha_short }}-${{ matrix.compiler }}-${{ matrix.platform }}
-          path: ./publish/${{ matrix.platform }}
+      with:
+        name: Magpie-dev-${{ steps.hash.outputs.sha_short }}-${{ matrix.compiler }}-${{ matrix.platform }}
+        path: ./publish/${{ matrix.platform }}
