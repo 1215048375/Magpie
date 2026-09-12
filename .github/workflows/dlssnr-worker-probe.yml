@@ -1,0 +1,72 @@
+name: DLSSNR worker probe
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/dlssnr-worker-probe.yml'
+      - 'tools/DLSSNR.Worker/**'
+
+jobs:
+  worker-probe:
+    runs-on: windows-2025-vs2026
+
+    steps:
+      - name: Checkout Magpie
+        uses: actions/checkout@v7
+
+      - name: Checkout NVIDIA DLSS SDK
+        uses: actions/checkout@v7
+        with:
+          repository: NVIDIA/DLSS
+          path: dependencies/dlss-sdk
+          lfs: true
+
+      - name: Setup MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Build nvngx.dll worker probe
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:GITHUB_WORKSPACE "dependencies\dlss-sdk"
+          $out = Join-Path $env:GITHUB_WORKSPACE "worker-probe"
+
+          New-Item -ItemType Directory -Force -Path $out | Out-Null
+
+          msbuild `
+            "$env:GITHUB_WORKSPACE\tools\DLSSNR.Worker\DLSSNR.Worker.vcxproj" `
+            /m `
+            /t:Rebuild `
+            /p:Configuration=Release `
+            /p:Platform=x64 `
+            /p:DLSSSdkDir="$sdk" `
+            /p:WorkerOutDir="$out\" `
+            /v:minimal
+
+          if (!(Test-Path (Join-Path $out "nvngx.dll"))) {
+            throw "worker build completed without nvngx.dll"
+          }
+
+          Copy-Item `
+            "$env:GITHUB_WORKSPACE\tools\DLSSNR.Worker\run-worker-probe.ps1" `
+            (Join-Path $out "run-worker-probe.ps1")
+
+          @"
+          Magpie DLSSNR worker probe
+
+          1. Copy your existing nvngx_dlssnr.dll into this folder.
+          2. Right-click run-worker-probe.ps1 -> Run with PowerShell,
+             or run:
+               powershell -ExecutionPolicy Bypass -File .\run-worker-probe.ps1
+          3. Send magpie-dlssnr-worker-probe.log back for analysis.
+
+          Important:
+          nvngx.dll here is an executable PE intentionally named .dll.
+          Do not load it with rundll32.
+          "@ | Set-Content -Encoding UTF8 (Join-Path $out "README.txt")
+
+      - name: Upload worker probe
+        uses: actions/upload-artifact@v7
+        with:
+          name: Magpie-DLSSNR-worker-probe-x64
+          path: worker-probe
