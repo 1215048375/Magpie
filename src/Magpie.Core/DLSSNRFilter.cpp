@@ -1295,8 +1295,7 @@ static bool StartExternalWorker(
 	}
 
 	Logger::Get().Info(fmt::format(
-		"DLSSNR external worker ready: session={} pid={} size={}x{} format={}",
-		std::string(impl.workerSession.begin(), impl.workerSession.end()),
+		"DLSSNR external worker ready: pid={} size={}x{} format={}",
 		GetProcessId(impl.workerProcess.get()),
 		impl.width, impl.height,
 		static_cast<uint32_t>(sharedDesc.Format)));
