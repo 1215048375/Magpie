@@ -1019,6 +1019,7 @@ struct DLSSNRFilter::Impl {
 	float experimentalHdrScale = 1.0f;
 	bool useResolutionScaling = false;
 	bool coreRegistered = false;
+	bool directParameterBlock = false;
 	bool snippetInitialized = false;
 	bool snippetCallerHookInstalled = false;
 	bool useSignedSnippet = false;
@@ -1089,6 +1090,24 @@ NVSDK_NGX_Result CallSnippetInitSafely(
 		return function(
 			DLSSNR_SIGNED_SNIPPET_APPLICATION_ID, applicationDataPath,
 			device, NVSDK_NGX_Version_API, nullptr);
+	}, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
+}
+
+NVSDK_NGX_Result AllocateParametersDirectSafely(
+	NVSDK_NGX_Parameter** parameters,
+	DWORD* sehCode
+) noexcept {
+	return NgxRuntimeGuard::Invoke([&]() {
+		return NVSDK_NGX_D3D12_AllocateParameters(parameters);
+	}, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
+}
+
+NVSDK_NGX_Result DestroyParametersDirectSafely(
+	NVSDK_NGX_Parameter* parameters,
+	DWORD* sehCode
+) noexcept {
+	return NgxRuntimeGuard::Invoke([&]() {
+		return NVSDK_NGX_D3D12_DestroyParameters(parameters);
 	}, NVSDK_NGX_Result_FAIL_PlatformError, sehCode);
 }
 
@@ -1368,7 +1387,19 @@ DLSSNRFilter::Impl::~Impl() {
 		feature = nullptr;
 	}
 	if (parameters) {
-		if (!coreOwner || !coreOwner->DestroyParameters(parameters, "DLSSNR")) {
+		if (directParameterBlock) {
+			DWORD sehCode = 0;
+			const NVSDK_NGX_Result result =
+				DestroyParametersDirectSafely(parameters, &sehCode);
+			if (sehCode) {
+				Logger::Get().Warn(fmt::format(
+					"DLSSNR direct parameter destruction raised SEH {:#x}", sehCode));
+			} else if (!NGXSucceeded(result)) {
+				Logger::Get().Warn(fmt::format(
+					"DLSSNR direct parameter destruction failed ({:#x})",
+					(uint32_t)result));
+			}
+		} else if (!coreOwner || !coreOwner->DestroyParameters(parameters, "DLSSNR")) {
 			Logger::Get().Warn("DLSSNR shared Core parameter destruction failed");
 		}
 		parameters = nullptr;
@@ -2285,12 +2316,19 @@ bool DLSSNRFilter::Initialize(
 		Logger::Get().Warn(
 			"DLSSNR NVAPI arch spoof unavailable; continuing without spoof");
 	}
-	if (!ngxCore.Acquire(resources, "DLSSNR")) {
+	// DLSSNR direct-runtime experiment: avoid the shared NGX Core
+	// Init_with_ProjectID path, which rejects pre-Blackwell GPUs before the
+	// signed Feature 18 snippet gets a chance to initialize.
+	HRESULT hr = D3D12CreateDevice(
+		resources.GetGraphicsAdapter(), D3D_FEATURE_LEVEL_11_0,
+		IID_PPV_ARGS(impl->device12.put()));
+	if (FAILED(hr)) {
+		Logger::Get().ComError("Create private DLSSNR D3D12 device failed", hr);
 		return false;
 	}
-	impl->coreRegistered = true;
-	impl->device12.copy_from(ngxCore.Device());
-	HRESULT hr = S_OK;
+	Logger::Get().Info(
+		"DLSSNR direct runtime: private D3D12 device created; shared NGX Core init skipped");
+	hr = S_OK;
 	D3D12_COMMAND_QUEUE_DESC queueDesc{};
 	queueDesc.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 	hr = impl->device12->CreateCommandQueue(&queueDesc, IID_PPV_ARGS(impl->queue12.put()));
@@ -2417,9 +2455,21 @@ bool DLSSNRFilter::Initialize(
 		if (!InitializeSignedSnippet(*impl, applicationDirectory)) return false;
 	}
 
-	if (!ngxCore.AllocateParameters(&impl->parameters, "DLSSNR")) {
+	sehCode = 0;
+	result = AllocateParametersDirectSafely(&impl->parameters, &sehCode);
+	if (sehCode) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR direct AllocateParameters raised SEH {:#x}", sehCode));
 		return false;
 	}
+	if (!NGXSucceeded(result) || !impl->parameters) {
+		Logger::Get().Error(fmt::format(
+			"DLSSNR direct AllocateParameters failed ({:#x})",
+			(uint32_t)result));
+		return false;
+	}
+	impl->directParameterBlock = true;
+	Logger::Get().Info("DLSSNR direct runtime: parameter block allocated");
 	sehCode = 0;
 	if (!SetCreateParametersSafely(*impl, &sehCode)) {
 		Logger::Get().Error(fmt::format(
