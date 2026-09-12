@@ -572,7 +572,7 @@ int wmain() {
         (exe.empty() ? std::filesystem::path(L".") : exe.parent_path()) /
         L"magpie-dlssnr-worker-probe.log";
 
-    _wfopen_s(&g_log, logPath.c_str(), L"w, ccs=UTF-8");
+    _wfopen_s(&g_log, logPath.c_str(), L"wb");
 
     Log("=== Magpie NeuralScreen-style DLSSNR worker probe ===");
     Log("This binary is intentionally an executable PE named nvngx.dll.");
