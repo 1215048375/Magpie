@@ -72,7 +72,8 @@ bool CreateNamedSharedTexture(
     uint32_t width,
     uint32_t height,
     const std::wstring& name,
-    ComPtr<ID3D11Texture2D>& texture) {
+    ComPtr<ID3D11Texture2D>& texture,
+    HANDLE& sharedHandle) {
     D3D11_TEXTURE2D_DESC desc{};
     desc.Width = width;
     desc.Height = height;
@@ -101,15 +102,14 @@ bool CreateNamedSharedTexture(
     hr = texture.As(&dxgi);
     if (FAILED(hr)) return false;
 
-    HANDLE h = nullptr;
+    sharedHandle = nullptr;
     hr = dxgi->CreateSharedHandle(
-        nullptr, GENERIC_ALL, name.c_str(), &h);
+        nullptr, GENERIC_ALL, name.c_str(), &sharedHandle);
     if (FAILED(hr)) {
         Log("D3D11: CreateSharedHandle(%ls) failed hr=0x%08x",
             name.c_str(), static_cast<unsigned>(hr));
         return false;
     }
-    CloseHandle(h);
     Log("D3D11: created %ls", name.c_str());
     return true;
 }
@@ -117,7 +117,8 @@ bool CreateNamedSharedTexture(
 bool CreateNamedSharedFence(
     ID3D11Device5* device,
     const std::wstring& name,
-    ComPtr<ID3D11Fence>& fence) {
+    ComPtr<ID3D11Fence>& fence,
+    HANDLE& sharedHandle) {
     HRESULT hr = device->CreateFence(
         0, D3D11_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fence));
     if (FAILED(hr)) {
@@ -126,15 +127,14 @@ bool CreateNamedSharedFence(
         return false;
     }
 
-    HANDLE h = nullptr;
+    sharedHandle = nullptr;
     hr = fence->CreateSharedHandle(
-        nullptr, GENERIC_ALL, name.c_str(), &h);
+        nullptr, GENERIC_ALL, name.c_str(), &sharedHandle);
     if (FAILED(hr)) {
         Log("D3D11: fence CreateSharedHandle failed hr=0x%08x",
             static_cast<unsigned>(hr));
         return false;
     }
-    CloseHandle(h);
     Log("D3D11: created %ls", name.c_str());
     return true;
 }
@@ -341,18 +341,26 @@ int wmain() {
     ComPtr<ID3D11Texture2D> input;
     ComPtr<ID3D11Texture2D> output;
     ComPtr<ID3D11Fence> fence;
+    HANDLE inputSharedHandle = nullptr;
+    HANDLE outputSharedHandle = nullptr;
+    HANDLE fenceSharedHandle = nullptr;
 
     if (!CreateNamedSharedTexture(
             device.Get(), kWidth, kHeight,
-            InputName(session), input) ||
+            InputName(session), input, inputSharedHandle) ||
         !CreateNamedSharedTexture(
             device.Get(), kWidth, kHeight,
-            OutputName(session), output) ||
+            OutputName(session), output, outputSharedHandle) ||
         !CreateNamedSharedFence(
-            device.Get(), FenceName(session), fence)) {
+            device.Get(), FenceName(session), fence, fenceSharedHandle)) {
+        if (fenceSharedHandle) CloseHandle(fenceSharedHandle);
+        if (outputSharedHandle) CloseHandle(outputSharedHandle);
+        if (inputSharedHandle) CloseHandle(inputSharedHandle);
         return 8;
     }
 
+    // Keep the original NT shared handles alive until the worker has opened
+    // and finished using the named objects.
     FillInput(context.Get(), input.Get(), kWidth, kHeight);
 
     // Ensure input writes are queued before advertising fence value 1.
@@ -422,6 +430,10 @@ int wmain() {
     CloseHandle(pi.hProcess);
 
     Log("PROCESS: worker exit code=%lu", exitCode);
+
+    if (fenceSharedHandle) CloseHandle(fenceSharedHandle);
+    if (outputSharedHandle) CloseHandle(outputSharedHandle);
+    if (inputSharedHandle) CloseHandle(inputSharedHandle);
 
     if (outputValid && exitCode == 0) {
         Log("SUCCESS: D3D11 -> nvngx.dll/D3D12 -> D3D11 bridge works");
